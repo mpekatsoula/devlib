@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import subprocess
 from devlib.module import Module
 from devlib.exception import TargetError
 from devlib.utils.misc import memoized
@@ -104,11 +105,11 @@ class CpufreqModule(Module):
             try:
                 tunables_path = '/sys/devices/system/cpu/{}/cpufreq/{}'.format(cpu, governor)
                 self._governor_tunables[governor] = self.target.list_directory(tunables_path)
-            except TargetError:  # probably an older kernel
+            except (TargetError,subprocess.CalledProcessError):  # probably an older kernel
                 try:
                     tunables_path = '/sys/devices/system/cpu/cpufreq/{}'.format(governor)
                     self._governor_tunables[governor] = self.target.list_directory(tunables_path)
-                except TargetError:  # governor does not support tunables
+                except (TargetError,subprocess.CalledProcessError):  # governor does not support tunables
                     self._governor_tunables[governor] = []
         return self._governor_tunables[governor]
 
@@ -122,7 +123,7 @@ class CpufreqModule(Module):
                 try:
                     path = '/sys/devices/system/cpu/{}/cpufreq/{}/{}'.format(cpu, governor, tunable)
                     tunables[tunable] = self.target.read_value(path)
-                except TargetError:  # May be an older kernel
+                except (TargetError,subprocess.CalledProcessError):  # May be an older kernel
                     path = '/sys/devices/system/cpu/cpufreq/{}/{}'.format(governor, tunable)
                     tunables[tunable] = self.target.read_value(path)
         return tunables
@@ -155,7 +156,7 @@ class CpufreqModule(Module):
                 path = '/sys/devices/system/cpu/{}/cpufreq/{}/{}'.format(cpu, governor, tunable)
                 try:
                     self.target.write_value(path, value)
-                except TargetError:
+                except (TargetError,subprocess.CalledProcessError):
                     if self.target.file_exists(path):
                         # File exists but we did something wrong
                         raise
@@ -177,7 +178,7 @@ class CpufreqModule(Module):
             cmd = 'cat /sys/devices/system/cpu/{}/cpufreq/scaling_available_frequencies'.format(cpu)
             output = self.target.execute(cmd)
             available_frequencies = map(int, output.strip().split())  # pylint: disable=E1103
-        except TargetError:
+        except (TargetError,subprocess.CalledProcessError):
             # On some devices scaling_frequencies  is not generated.
             # http://adrynalyne-teachtofish.blogspot.co.uk/2011/11/how-to-enable-scalingavailablefrequenci.html
             # Fall back to parsing stats/time_in_state

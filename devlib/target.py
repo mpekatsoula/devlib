@@ -80,7 +80,7 @@ class Target(object):
         try:
             self.execute('ls /', timeout=2, as_root=True)
             return True
-        except (TargetError, TimeoutError):
+        except (TargetError, TimeoutError,subprocess.CalledProcessError):
             return False
 
     @property
@@ -126,7 +126,7 @@ class Target(object):
             for path in ['/boot/config', '/boot/config-$(uname -r)']:
                 try:
                     return KernelConfig(self.execute('cat {}'.format(path)))
-                except TargetError:
+                except (TargetError,subprocess.CalledProcessError):
                     pass
         return KernelConfig('')
 
@@ -298,7 +298,7 @@ class Target(object):
         try:
             self.execute('{} tar -cvf {} {}'.format(self.busybox, tar_file_name,
                                                      source_dir))
-        except TargetError:
+        except (TargetError,subprocess.CalledProcessError):
             self.logger.debug('Failed to run tar command on target! ' \
                               'Not pulling directory {}'.format(source_dir))
         # Pull the file
@@ -402,7 +402,7 @@ class Target(object):
         for pid in self.get_pids_of(process_name):
             try:
                 self.kill(pid, signal=signal, as_root=as_root)
-            except TargetError:
+            except (TargetError,subprocess.CalledProcessError):
                 pass
 
     def get_pids_of(self, process_name):
@@ -502,7 +502,7 @@ class Target(object):
                 try:
                     if name in self.list_directory(path):
                         return self.path.join(path, name)
-                except TargetError:
+                except (TargetError,subprocess.CalledProcessError):
                     pass  # directory does not exist or no executable premssions
 
     which = get_installed
@@ -671,7 +671,7 @@ class LinuxTarget(Target):
                 name = self.path.basename(vf)
                 output = self.read_value(vf)
                 os_version[name] = output.strip().replace('\n', ' ')
-        except TargetError:
+        except (TargetError,subprocess.CalledProcessError):
             raise
         return os_version
 
@@ -925,7 +925,7 @@ class AndroidTarget(Target):
         self.ls_command = 'ls -1'
         try:
             self.execute('ls -1 {}'.format(self.working_directory), as_root=False)
-        except TargetError:
+        except (TargetError,subprocess.CalledProcessError):
             self.ls_command = 'ls'
 
     def list_directory(self, path, as_root=False):

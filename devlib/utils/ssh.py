@@ -201,8 +201,7 @@ class SshConnection(object):
                     try:
                         exit_code = int(exit_code_text)
                         if exit_code:
-                            message = 'Got exit code {}\nfrom: {}\nOUTPUT: {}'
-                            raise TargetError(message.format(exit_code, command, output))
+                            raise subprocess.CalledProcessError(exit_code, command, output)
                     except (ValueError, IndexError):
                         logger.warning(
                             'Could not get exit code for "{}",\ngot: "{}"'\

@@ -122,7 +122,7 @@ class Target(object):
     def config(self):
         try:
             return KernelConfig(self.execute('zcat /proc/config.gz'))
-        except TargetError:
+        except (TargetError,subprocess.CalledProcessError):
             for path in ['/boot/config', '/boot/config-$(uname -r)']:
                 try:
                     return KernelConfig(self.execute('cat {}'.format(path)))

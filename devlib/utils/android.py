@@ -33,7 +33,7 @@ from devlib.utils.misc import escape_single_quotes, escape_double_quotes
 
 logger = logging.getLogger('android')
 
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 0
 AM_START_ERROR = re.compile(r"Error: Activity.*")
 
 # See:

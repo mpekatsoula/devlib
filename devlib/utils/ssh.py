@@ -213,7 +213,7 @@ class SshConnection(object):
     def background(self, command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, as_root=False):
         try:
             port_string = '-p {}'.format(self.port) if self.port else ''
-            keyfile_string = '-i {}'.format(self.keyfile) if self.keyfile else ''
+            keyfile_string = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
             if as_root:
                 command = self.sudo_cmd.format(command)
             command = '{} {} {} {}@{} {}'.format(ssh, keyfile_string, port_string, self.username, self.host, command)

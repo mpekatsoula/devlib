@@ -1,4 +1,4 @@
-#    Copyright 2014-2015 ARM Limited
+#    Copyright 2014-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -63,7 +63,7 @@ class FastbootFlashModule(FlashModule):
             image_bundle = expand_path(image_bundle)
             to_flash = self._bundle_to_images(image_bundle)
         to_flash = merge_dicts(to_flash, images or {}, should_normalize=False)
-        for partition, image_path in to_flash.iteritems():
+        for partition, image_path in to_flash.items():
             self.logger.debug('flashing {}'.format(partition))
             self._flash_image(self.target, partition, expand_path(image_path))
         fastboot_command('reboot')
@@ -125,4 +125,3 @@ def get_mapping(base_dir, partition_file):
                 HostError('file {} was not found in the bundle or was misplaced'.format(pair[1]))
             mapping[pair[0]] = image_path
     return mapping
-

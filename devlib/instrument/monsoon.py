@@ -1,14 +1,31 @@
-import csv
+#    Copyright 2018 ARM Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 import os
 import signal
+import sys
 from subprocess import Popen, PIPE
 from tempfile import NamedTemporaryFile
+
 from devlib.instrument import Instrument, CONTINUOUS, MeasurementsCsv
 from devlib.exception import HostError
-from devlib.host import PACKAGE_BIN_DIRECTORY
+from devlib.utils.csvutil import csvwriter
 from devlib.utils.misc import which
 
-INSTALL_INSTRUCTIONS="""
+
+INSTALL_INSTRUCTIONS = """
 MonsoonInstrument requires the monsoon.py tool, available from AOSP:
 
 https://android.googlesource.com/platform/cts/+/master/tools/utils/monsoon.py
@@ -17,6 +34,7 @@ Download this script and put it in your $PATH (or pass it as the monsoon_bin
 parameter to MonsoonInstrument). `pip install python-gflags pyserial` to install
 the dependencies.
 """
+
 
 class MonsoonInstrument(Instrument):
     """Instrument for Monsoon Solutions power monitor
@@ -49,6 +67,7 @@ class MonsoonInstrument(Instrument):
 
         self.process = None
         self.output = None
+        self.buffer_file = None
 
         self.sample_rate_hz = 500
         self.add_channel('output', 'power')
@@ -81,6 +100,9 @@ class MonsoonInstrument(Instrument):
         process.poll()
         if process.returncode is not None:
             stdout, stderr = process.communicate()
+            if sys.version_info[0] == 3:
+                stdout = stdout.encode(sys.stdout.encoding or 'utf-8')
+                stderr = stderr.encode(sys.stdout.encoding or 'utf-8')
             raise HostError(
                 'Monsoon script exited unexpectedly with exit code {}.\n'
                 'stdout:\n{}\nstderr:\n{}'.format(process.returncode,
@@ -88,7 +110,7 @@ class MonsoonInstrument(Instrument):
 
         process.send_signal(signal.SIGINT)
 
-        stderr =  process.stderr.read()
+        stderr = process.stderr.read()
 
         self.buffer_file.close()
         with open(self.buffer_file.name) as f:
@@ -102,10 +124,9 @@ class MonsoonInstrument(Instrument):
         if self.process:
             raise RuntimeError('`get_data` called before `stop`')
 
-        stdout, stderr = self.output
+        stdout, _ = self.output
 
-        with open(outfile, 'wb') as f:
-            writer = csv.writer(f)
+        with csvwriter(outfile) as writer:
             active_sites = [c.site for c in self.active_channels]
 
             # Write column headers
@@ -129,4 +150,4 @@ class MonsoonInstrument(Instrument):
                     row.append(usb)
                 writer.writerow(row)
 
-        return MeasurementsCsv(outfile, self.active_channels)
+        return MeasurementsCsv(outfile, self.active_channels, self.sample_rate_hz)

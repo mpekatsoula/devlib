@@ -1,4 +1,4 @@
-#    Copyright 2016 ARM Limited
+#    Copyright 2016-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +15,13 @@
 import os
 import re
 import subprocess
-import sys
 import shutil
 import time
 import types
+import shlex
+from pipes import quote
 
-from devlib.exception import TargetError
+from devlib.exception import TargetStableError
 from devlib.host import PACKAGE_BIN_DIRECTORY
 from devlib.platform import Platform
 from devlib.utils.ssh import AndroidGem5Connection, LinuxGem5Connection
@@ -55,7 +56,7 @@ class Gem5SimulationPlatform(Platform):
         self.stdout_file = None
         self.stderr_file = None
         self.stderr_filename = None
-        if self.gem5_port is None:
+        if self.gem5_port is None:  # pylint: disable=simplifiable-if-statement
             # Allows devlib to pick up already running simulations
             self.start_gem5_simulation = True
         else:
@@ -63,13 +64,12 @@ class Gem5SimulationPlatform(Platform):
 
         # Find the first one that does not exist. Ensures that we do not re-use
         # the directory used by someone else.
-        for i in xrange(sys.maxint):
+        i = 0
+        directory = os.path.join(self.gem5_interact_dir, "wa_{}".format(i))
+        while os.path.exists(directory):
+            i += 1
             directory = os.path.join(self.gem5_interact_dir, "wa_{}".format(i))
-            try:
-                os.stat(directory)
-                continue
-            except OSError:
-                break
+
         self.gem5_interact_dir = directory
         self.logger.debug("Using {} as the temporary directory."
                           .format(self.gem5_interact_dir))
@@ -88,12 +88,12 @@ class Gem5SimulationPlatform(Platform):
         Check if the command to start gem5 makes sense
         """
         if self.gem5args_binary is None:
-            raise TargetError('Please specify a gem5 binary.')
+            raise TargetStableError('Please specify a gem5 binary.')
         if self.gem5args_args is None:
-            raise TargetError('Please specify the arguments passed on to gem5.')
+            raise TargetStableError('Please specify the arguments passed on to gem5.')
         self.gem5args_virtio = str(self.gem5args_virtio).format(self.gem5_interact_dir)
         if self.gem5args_virtio is None:
-            raise TargetError('Please specify arguments needed for virtIO.')
+            raise TargetStableError('Please specify arguments needed for virtIO.')
 
     def _start_interaction_gem5(self):
         """
@@ -112,7 +112,7 @@ class Gem5SimulationPlatform(Platform):
             if not os.path.exists(self.stats_directory):
                 os.mkdir(self.stats_directory)
             if os.path.exists(self.gem5_out_dir):
-                raise TargetError("The gem5 stats directory {} already "
+                raise TargetStableError("The gem5 stats directory {} already "
                                   "exists.".format(self.gem5_out_dir))
             else:
                 os.mkdir(self.gem5_out_dir)
@@ -131,11 +131,11 @@ class Gem5SimulationPlatform(Platform):
             self.logger.info("Starting the gem5 simulator")
 
             command_line = "{} --outdir={} {} {}".format(self.gem5args_binary,
-                                                         self.gem5_out_dir,
+                                                         quote(self.gem5_out_dir),
                                                          self.gem5args_args,
                                                          self.gem5args_virtio)
             self.logger.debug("gem5 command line: {}".format(command_line))
-            self.gem5 = subprocess.Popen(command_line.split(),
+            self.gem5 = subprocess.Popen(shlex.split(command_line),
                                          stdout=self.stdout_file,
                                          stderr=self.stderr_file)
 
@@ -155,7 +155,7 @@ class Gem5SimulationPlatform(Platform):
         e.g. pid, input directory etc
         """
         self.logger("This functionality is not yet implemented")
-        raise TargetError()
+        raise TargetStableError()
 
     def _intercept_telnet_port(self):
         """
@@ -163,17 +163,22 @@ class Gem5SimulationPlatform(Platform):
         """
 
         if self.gem5 is None:
-            raise TargetError('The platform has no gem5 simulation! '
+            raise TargetStableError('The platform has no gem5 simulation! '
                               'Something went wrong')
         while self.gem5_port is None:
             # Check that gem5 is running!
             if self.gem5.poll():
-                raise TargetError("The gem5 process has crashed with error code {}!".format(self.gem5.poll()))
+                message = "The gem5 process has crashed with error code {}!\n\tPlease see {} for details."
+                raise TargetStableError(message.format(self.gem5.poll(), self.stderr_file.name))
 
             # Open the stderr file
             with open(self.stderr_filename, 'r') as f:
                 for line in f:
+                    # Look for two different strings, exact wording depends on
+                    # version of gem5
                     m = re.search(r"Listening for system connection on port (?P<port>\d+)", line)
+                    if not m:
+                        m = re.search(r"Listening for connections on port (?P<port>\d+)", line)
                     if m:
                         port = int(m.group('port'))
                         if port >= 3456 and port < 5900:
@@ -182,7 +187,7 @@ class Gem5SimulationPlatform(Platform):
                     # Check if the sockets are not disabled
                     m = re.search(r"Sockets disabled, not accepting terminal connections", line)
                     if m:
-                        raise TargetError("The sockets have been disabled!"
+                        raise TargetStableError("The sockets have been disabled!"
                                           "Pass --listener-mode=on to gem5")
                 else:
                     time.sleep(1)
@@ -200,9 +205,7 @@ class Gem5SimulationPlatform(Platform):
         """
         Deploy m5 if not yet installed
         """
-        m5_path = target.get_installed('m5')
-        if m5_path is None:
-            m5_path = self._deploy_m5(target)
+        m5_path = self._deploy_m5(target)
         target.conn.m5_path = m5_path
 
         # Set the terminal settings for the connection to gem5
@@ -232,12 +235,19 @@ class Gem5SimulationPlatform(Platform):
         # Call the general update_from_target implementation
         super(Gem5SimulationPlatform, self).update_from_target(target)
 
+
     def gem5_capture_screen(self, filepath):
         file_list = os.listdir(self.gem5_out_dir)
         screen_caps = []
         for f in file_list:
             if '.bmp' in f:
                 screen_caps.append(f)
+
+        if '{ts}' in filepath:
+            cmd = '{} date -u -Iseconds'
+            # pylint: disable=no-member
+            ts = self.target.execute(cmd.format(self.target.busybox)).strip()
+            filepath = filepath.format(ts=ts)
 
         successful_capture = False
         if len(screen_caps) == 1:
@@ -251,6 +261,7 @@ class Gem5SimulationPlatform(Platform):
                 im.save(temp_image, "PNG")
                 shutil.copy(temp_image, filepath)
                 os.remove(temp_image)
+                # pylint: disable=undefined-variable
                 gem5_logger.info("capture_screen: using gem5 screencap")
                 successful_capture = True
 
@@ -259,12 +270,14 @@ class Gem5SimulationPlatform(Platform):
 
         return successful_capture
 
+    # pylint: disable=no-self-use
     def _deploy_m5(self, target):
         # m5 is not yet installed so install it
         host_executable = os.path.join(PACKAGE_BIN_DIRECTORY,
                                        target.abi, 'm5')
         return target.install(host_executable)
 
+    # pylint: disable=no-self-use
     def _resize_shell(self, target):
         """
         Resize the shell to avoid line wrapping issues.
@@ -275,18 +288,16 @@ class Gem5SimulationPlatform(Platform):
         target.execute('reset', check_exit_code=False)
 
 # Methods that will be monkey-patched onto the target
-def _overwritten_reset(self):
-    raise TargetError('Resetting is not allowed on gem5 platforms!')
+def _overwritten_reset(self):  # pylint: disable=unused-argument
+    raise TargetStableError('Resetting is not allowed on gem5 platforms!')
 
-def _overwritten_reboot(self):
-    raise TargetError('Rebooting is not allowed on gem5 platforms!')
+def _overwritten_reboot(self):  # pylint: disable=unused-argument
+    raise TargetStableError('Rebooting is not allowed on gem5 platforms!')
 
 def _overwritten_capture_screen(self, filepath):
     connection_screencapped = self.platform.gem5_capture_screen(filepath)
-    if connection_screencapped == False:
+    if not connection_screencapped:
         # The connection was not able to capture the screen so use the target
         # implementation
         self.logger.debug('{} was not able to screen cap, using the original target implementation'.format(self.platform.__class__.__name__))
         self.target_impl_capture_screen(filepath)
-
-

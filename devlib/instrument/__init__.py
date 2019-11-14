@@ -1,4 +1,4 @@
-#    Copyright 2015 ARM Limited
+#    Copyright 2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,14 @@
 # limitations under the License.
 #
 from __future__ import division
-import csv
 import logging
 import collections
 
+from past.builtins import basestring
+
+from devlib.utils.csvutil import csvreader
 from devlib.utils.types import numeric
+from devlib.utils.types import identifier
 
 
 # Channel modes describe what sort of measurement the instrument supports.
@@ -36,7 +39,7 @@ class MeasurementType(object):
         self.category = category
         self.conversions = {}
         if conversions is not None:
-            for key, value in conversions.iteritems():
+            for key, value in conversions.items():
                 if not callable(value):
                     msg = 'Converter must be callable; got {} "{}"'
                     raise ValueError(msg.format(type(value), value))
@@ -48,11 +51,14 @@ class MeasurementType(object):
         if not isinstance(to, MeasurementType):
             msg = 'Unexpected conversion target: "{}"'
             raise ValueError(msg.format(to))
+        if to.name == self.name:
+            return value
         if not to.name in self.conversions:
             msg = 'No conversion from {} to {} available'
             raise ValueError(msg.format(self.name, to.name))
         return self.conversions[to.name](value)
 
+    # pylint: disable=undefined-variable
     def __cmp__(self, other):
         if isinstance(other, MeasurementType):
             other = other.name
@@ -70,30 +76,70 @@ class MeasurementType(object):
             return text.format(self.name, self.units)
 
 
-# Standard measures
+# Standard measures. In order to make sure that downstream data processing is not tied
+# to particular insturments (e.g. a particular method of mearuing power), instruments
+# must, where possible, resport their measurments formatted as on of the standard types
+# defined here.
 _measurement_types = [
+    # For whatever reason, the type of measurement could not be established.
     MeasurementType('unknown', None),
-    MeasurementType('time', 'seconds',
-        conversions={
-            'time_us': lambda x: x * 1000,
-        }
-    ),
-    MeasurementType('time_us', 'microseconds',
-        conversions={
-            'time': lambda x: x / 1000,
-        }
-    ),
-    MeasurementType('temperature', 'degrees'),
 
+    # Generic measurements
+    MeasurementType('count', 'count'),
+    MeasurementType('percent', 'percent'),
+
+    # Time measurement. While there is typically a single "canonical" unit
+    # used for each type of measurmenent, time may be measured to a wide variety
+    # of events occuring at a wide range of scales. Forcing everying into a
+    # single scale will lead to inefficient and awkward to work with result tables.
+    # Coversion functions between the formats are specified, so that downstream
+    # processors that expect all times time be at a particular scale can automatically
+    # covert without being familar with individual instruments.
+    MeasurementType('time', 'seconds', 'time',
+        conversions={
+            'time_us': lambda x: x * 1e6,
+            'time_ms': lambda x: x * 1e3,
+            'time_ns': lambda x: x * 1e9,
+        }
+    ),
+    MeasurementType('time_us', 'microseconds', 'time',
+        conversions={
+            'time': lambda x: x / 1e6,
+            'time_ms': lambda x: x / 1e3,
+            'time_ns': lambda x: x * 1e3,
+        }
+    ),
+    MeasurementType('time_ms', 'milliseconds', 'time',
+        conversions={
+            'time': lambda x: x / 1e3,
+            'time_us': lambda x: x * 1e3,
+            'time_ns': lambda x: x * 1e6,
+        }
+    ),
+    MeasurementType('time_ns', 'nanoseconds', 'time',
+    conversions={
+        'time': lambda x: x / 1e9,
+        'time_ms': lambda x: x / 1e6,
+        'time_us': lambda x: x / 1e3,
+        }
+    ),
+
+    # Measurements related to thermals.
+    MeasurementType('temperature', 'degrees', 'thermal'),
+
+    # Measurements related to power end energy consumption.
     MeasurementType('power', 'watts', 'power/energy'),
     MeasurementType('voltage', 'volts', 'power/energy'),
     MeasurementType('current', 'amps', 'power/energy'),
     MeasurementType('energy', 'joules', 'power/energy'),
 
+    # Measurments realted to data transfer, e.g. neworking,
+    # memory, or backing storage.
     MeasurementType('tx', 'bytes', 'data transfer'),
     MeasurementType('rx', 'bytes', 'data transfer'),
     MeasurementType('tx/rx', 'bytes', 'data transfer'),
 
+    MeasurementType('fps', 'fps', 'ui render'),
     MeasurementType('frames', 'frames', 'ui render'),
 ]
 for m in _measurement_types:
@@ -116,8 +162,9 @@ class Measurement(object):
         self.value = value
         self.channel = channel
 
+    # pylint: disable=undefined-variable
     def __cmp__(self, other):
-        if isinstance(other, Measurement):
+        if hasattr(other, 'value'):
             return cmp(self.value, other.value)
         else:
             return cmp(self.value, other)
@@ -133,53 +180,73 @@ class Measurement(object):
 
 class MeasurementsCsv(object):
 
-    def __init__(self, path, channels=None):
+    def __init__(self, path, channels=None, sample_rate_hz=None):
         self.path = path
         self.channels = channels
-        self._fh = open(path, 'rb')
+        self.sample_rate_hz = sample_rate_hz
         if self.channels is None:
             self._load_channels()
+        headings = [chan.label for chan in self.channels]
+        self.data_tuple = collections.namedtuple('csv_entry',
+                                                 map(identifier, headings))
 
     def measurements(self):
-        return list(self.itermeasurements())
+        return list(self.iter_measurements())
 
-    def itermeasurements(self):
-        self._fh.seek(0)
-        reader = csv.reader(self._fh)
-        reader.next()  # headings
-        for row in reader:
+    def iter_measurements(self):
+        for row in self._iter_rows():
             values = map(numeric, row)
             yield [Measurement(v, c) for (v, c) in zip(values, self.channels)]
 
+    def values(self):
+        return list(self.iter_values())
+
+    def iter_values(self):
+        for row in self._iter_rows():
+            values = list(map(numeric, row))
+            yield self.data_tuple(*values)
+
     def _load_channels(self):
-        self._fh.seek(0)
-        reader = csv.reader(self._fh)
-        header = reader.next()
-        self._fh.seek(0)
+        header = []
+        with csvreader(self.path) as reader:
+            header = next(reader)
 
         self.channels = []
         for entry in header:
             for mt in MEASUREMENT_TYPES:
                 suffix = '_{}'.format(mt)
                 if entry.endswith(suffix):
-                    site =  entry[:-len(suffix)]
+                    site = entry[:-len(suffix)]
                     measure = mt
-                    name = '{}_{}'.format(site, measure)
                     break
             else:
-                site = entry
-                measure = 'unknown'
-                name = entry
+                if entry in MEASUREMENT_TYPES:
+                    site = None
+                    measure = entry
+                else:
+                    site = entry
+                    measure = 'unknown'
 
-            chan = InstrumentChannel(name, site, measure)
+            chan = InstrumentChannel(site, measure)
             self.channels.append(chan)
+
+    # pylint: disable=stop-iteration-return
+    def _iter_rows(self):
+        with csvreader(self.path) as reader:
+            next(reader)  # headings
+            for row in reader:
+                yield row
 
 
 class InstrumentChannel(object):
 
     @property
     def label(self):
-        return '{}_{}'.format(self.site, self.kind)
+        if self.site is not None:
+            return '{}_{}'.format(self.site, self.kind)
+        return self.kind
+
+    name = label
 
     @property
     def kind(self):
@@ -189,8 +256,7 @@ class InstrumentChannel(object):
     def units(self):
         return self.measurement_type.units
 
-    def __init__(self, name, site, measurement_type, **attrs):
-        self.name = name
+    def __init__(self, site, measurement_type, **attrs):
         self.site = site
         if isinstance(measurement_type, MeasurementType):
             self.measurement_type = measurement_type
@@ -199,7 +265,7 @@ class InstrumentChannel(object):
                 self.measurement_type = MEASUREMENT_TYPES[measurement_type]
             except KeyError:
                 raise ValueError('Unknown measurement type:  {}'.format(measurement_type))
-        for atname, atvalue in attrs.iteritems():
+        for atname, atvalue in attrs.items():
             setattr(self, atname, atvalue)
 
     def __str__(self):
@@ -225,17 +291,15 @@ class Instrument(object):
     # channel management
 
     def list_channels(self):
-        return self.channels.values()
+        return list(self.channels.values())
 
     def get_channels(self, measure):
         if hasattr(measure, 'name'):
             measure = measure.name
         return [c for c in self.list_channels() if c.kind == measure]
 
-    def add_channel(self, site, measure, name=None, **attrs):
-        if name is None:
-            name = '{}_{}'.format(site, measure)
-        chan = InstrumentChannel(name, site, measure, **attrs)
+    def add_channel(self, site, measure, **attrs):
+        chan = InstrumentChannel(site, measure, **attrs)
         self.channels[chan.label] = chan
 
     # initialization and teardown
@@ -247,24 +311,26 @@ class Instrument(object):
         pass
 
     def reset(self, sites=None, kinds=None, channels=None):
-        if kinds is None and sites is None and channels is None:
+        if channels is not None:
+            if sites is not None or kinds is not None:
+                raise ValueError('sites and kinds should not be set if channels is set')
+
+            try:
+                self.active_channels = [self.channels[ch] for ch in channels]
+            except KeyError as e:
+                msg = 'Unexpected channel "{}"; must be in {}'
+                raise ValueError(msg.format(e, self.channels.keys()))
+        elif sites is None and kinds is None:
             self.active_channels = sorted(self.channels.values(), key=lambda x: x.label)
         else:
             if isinstance(sites, basestring):
                 sites = [sites]
             if isinstance(kinds, basestring):
                 kinds = [kinds]
-            self.active_channels = []
-            for chan_name in (channels or []):
-                try:
-                    self.active_channels.append(self.channels[chan_name])
-                except KeyError:
-                    msg = 'Unexpected channel "{}"; must be in {}'
-                    raise ValueError(msg.format(chan_name, self.channels.keys()))
-            for chan in self.channels.values():
-                if (kinds is None or chan.kind in kinds) and \
-                   (sites is None or chan.site in sites):
-                    self.active_channels.append(chan)
+
+            wanted = lambda ch: ((kinds is None or ch.kind in kinds) and
+                                  (sites is None or ch.site in sites))
+            self.active_channels = list(filter(wanted, self.channels.values()))
 
     # instantaneous
 
@@ -279,5 +345,9 @@ class Instrument(object):
     def stop(self):
         pass
 
+    # pylint: disable=no-self-use
     def get_data(self, outfile):
         pass
+
+    def get_raw(self):
+        return []

@@ -72,7 +72,7 @@ policies (governors). The ``devlib`` module exposes the following interface
 
    :param cpu: The cpu; could be a numeric or the corresponding string (e.g.
         ``1`` or ``"cpu1"``).
-   :param governor: The name of the governor. This must be one of the governors 
+   :param governor: The name of the governor. This must be one of the governors
                 supported by the CPU (as returned by ``list_governors()``.
 
    Keyword arguments may be used to specify governor tunable values.
@@ -106,11 +106,20 @@ policies (governors). The ``devlib`` module exposes the following interface
             target.cpufreq.set_min_frequency(cpu, frequency[, exact=True])
             target.cpufreq.set_max_frequency(cpu, frequency[, exact=True])
 
-   Get and set min and max frequencies on the specified CPU. "set" functions are
-   available with all governors other than ``userspace``.
+   Get the currently set, or set new min and max frequencies for the specified
+   CPU. "set" functions are available with all governors other than
+   ``userspace``.
 
    :param cpu: The cpu; could be a numeric or the corresponding string (e.g.
        ``1`` or ``"cpu1"``).
+
+.. method:: target.cpufreq.get_min_available_frequency(cpu)
+            target.cpufreq.get_max_available_frequency(cpu)
+
+    Retrieve the min or max DVFS frequency that is supported (as opposed to
+    currently enforced) for a given CPU. Returns an int or None if could not be
+    determined.
+
    :param frequency: Frequency to set.
 
 .. method:: target.cpufreq.get_frequency(cpu)
@@ -126,7 +135,7 @@ policies (governors). The ``devlib`` module exposes the following interface
 cpuidle
 -------
 
-``cpufreq`` is the kernel subsystem for managing CPU low power (idle) states.
+``cpuidle`` is the kernel subsystem for managing CPU low power (idle) states.
 
 .. method:: target.cpuidle.get_driver()
 
@@ -155,7 +164,7 @@ cpuidle
     Enable or disable the specified or all states (optionally on the specified
     CPU.
 
-You can also call ``enable()`` or ``disable()`` on :class:`CpuidleState` objects 
+You can also call ``enable()`` or ``disable()`` on :class:`CpuidleState` objects
 returned by get_state(s).
 
 cgroups
@@ -182,7 +191,7 @@ Every module (ultimately) derives from :class:`Module` class.  A module must
 define the following class attributes:
 
 :name: A unique name for the module. This cannot clash with any of the existing
-       names and must be a valid Python identifier, but is otherwise free-from.
+       names and must be a valid Python identifier, but is otherwise free-form.
 :kind: This identifies the type of functionality a module implements, which in
        turn determines the interface implemented by the module (all modules of
        the same kind must expose a consistent interface). This must be a valid
@@ -203,6 +212,9 @@ define the following class attributes:
         :early: The module will be installed when a :class:`Target` is first
                 created. This should be used for modules that do not rely on a
                 live connection to the target.
+        :setup: The module will be installed after initial setup of the device
+                has been performed. This allows the module to utilize assets
+                deployed during the setup stage for example 'Busybox'.
 
 Additionally, a module must implement a static (or class) method :func:`probe`:
 
@@ -271,7 +283,7 @@ HardResetModule
 .. method:: HardResetModule.__call__()
 
     Must be implemented by derived classes.
-    
+
     Implements hard reset for a target devices. The equivalent of physically
     power cycling the device.  This may be used by client code in situations
     where the target becomes unresponsive and/or a regular reboot is not
@@ -355,7 +367,7 @@ for an "Acme" device.
         name = 'acme_hard_reset'
 
         def __call__(self):
-            # Assuming Acme board comes with a "reset-acme-board" utility 
+            # Assuming Acme board comes with a "reset-acme-board" utility
             os.system('reset-acme-board {}'.format(self.target.name))
 
     register_module(AcmeHardReset)

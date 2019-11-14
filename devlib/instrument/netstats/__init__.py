@@ -1,14 +1,30 @@
+#    Copyright 2018 ARM Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 import os
 import re
-import csv
 import tempfile
 from datetime import datetime
 from collections import defaultdict
-from itertools import izip_longest
+
+from future.moves.itertools import zip_longest
 
 from devlib.instrument import Instrument, MeasurementsCsv, CONTINUOUS
-from devlib.exception import TargetError, HostError
+from devlib.exception import TargetStableError, HostError
 from devlib.utils.android import ApkInfo
+from devlib.utils.csvutil import csvwriter
 
 
 THIS_DIR = os.path.dirname(__file__)
@@ -46,10 +62,9 @@ def netstats_to_measurements(netstats):
 def write_measurements_csv(measurements, filepath):
     headers = sorted(measurements.keys())
     columns = [measurements[h] for h in headers]
-    with open(filepath, 'wb') as wfh:
-        writer = csv.writer(wfh)
+    with csvwriter(filepath) as writer:
         writer.writerow(headers)
-        writer.writerows(izip_longest(*columns))
+        writer.writerows(zip_longest(*columns))
 
 
 class NetstatsInstrument(Instrument):
@@ -69,7 +84,7 @@ class NetstatsInstrument(Instrument):
 
         """
         if target.os != 'android':
-            raise TargetError('netstats insturment only supports Android targets')
+            raise TargetStableError('netstats instrument only supports Android targets')
         if apk is None:
             apk = os.path.join(THIS_DIR, 'netstats.apk')
         if not os.path.isfile(apk):
@@ -86,6 +101,7 @@ class NetstatsInstrument(Instrument):
             self.add_channel(package, 'tx')
             self.add_channel(package, 'rx')
 
+    # pylint: disable=keyword-arg-before-vararg,arguments-differ
     def setup(self, force=False, *args, **kwargs):
         if self.target.package_is_installed(self.package):
             if force:

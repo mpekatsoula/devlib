@@ -1,4 +1,4 @@
-#    Copyright 2014-2015 ARM Limited
+#    Copyright 2014-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ import re
 import time
 import logging
 from copy import copy
+
+from past.builtins import basestring
 
 from devlib.utils.serial_port import write_characters, TIMEOUT
 from devlib.utils.types import boolean
@@ -193,14 +195,14 @@ class UefiMenu(object):
         is not in the current menu, ``LookupError`` will be raised."""
         if not self.prompt:
             self.read_menu(timeout)
-        return self.options.items()
+        return list(self.options.items())
 
     def get_option_index(self, text, timeout=default_timeout):
         """Returns the menu index of the specified option text (uses regex matching). If the option
         is not in the current menu, ``LookupError`` will be raised."""
         if not self.prompt:
             self.read_menu(timeout)
-        for k, v in self.options.iteritems():
+        for k, v in self.options.items():
             if re.search(text, v):
                 return k
         raise LookupError(text)
@@ -235,5 +237,3 @@ class UefiMenu(object):
         self.options = {}
         self.prompt = None
         self.empty_buffer()
-
-

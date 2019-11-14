@@ -1,4 +1,4 @@
-#    Copyright 2013-2015 ARM Limited
+#    Copyright 2013-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,29 +19,41 @@ Miscellaneous functions that don't fit anywhere else.
 
 """
 from __future__ import division
-import os
-import sys
-import re
-import string
-import threading
-import signal
-import subprocess
-import pkgutil
-import logging
-import random
-import ctypes
-from operator import itemgetter
+from contextlib import contextmanager
+from functools import partial, reduce
 from itertools import groupby
-from functools import partial
+from operator import itemgetter
 
+import ctypes
+import functools
+import logging
+import os
+import pkgutil
+import random
+import re
+import signal
+import string
+import subprocess
+import sys
+import threading
 import wrapt
+import warnings
 
+
+try:
+    from contextlib import ExitStack
+except AttributeError:
+    from contextlib2 import ExitStack
+
+from past.builtins import basestring
+
+# pylint: disable=redefined-builtin
 from devlib.exception import HostError, TimeoutError
 
 
 # ABI --> architectures list
 ABI_MAP = {
-    'armeabi': ['armeabi', 'armv7', 'armv7l', 'armv7el', 'armv7lh'],
+    'armeabi': ['armeabi', 'armv7', 'armv7l', 'armv7el', 'armv7lh', 'armeabi-v7a'],
     'arm64': ['arm64', 'armv8', 'arm64-v8a', 'aarch64'],
 }
 
@@ -79,8 +91,18 @@ CPU_PART_MAP = {
         0xd08: {None: 'A72'},
         0xd09: {None: 'A73'},
     },
+    0x42: {  # Broadcom
+        0x516: {None: 'Vulcan'},
+    },
+    0x43: {  # Cavium
+        0x0a1: {None: 'Thunderx'},
+        0x0a2: {None: 'Thunderx81xx'},
+    },
     0x4e: {  # Nvidia
         0x0: {None: 'Denver'},
+    },
+    0x50: {  # AppliedMicro
+        0x0: {None: 'xgene'},
     },
     0x51: {  # Qualcomm
         0x02d: {None: 'Scorpion'},
@@ -91,6 +113,10 @@ CPU_PART_MAP = {
         },
         0x205: {0x1: 'KryoSilver'},
         0x211: {0x1: 'KryoGold'},
+        0x800: {None: 'Falkor'},
+    },
+    0x53: {  # Samsung LSI
+        0x001: {0x1: 'MongooseM1'},
     },
     0x56: {  # Marvell
         0x131: {
@@ -121,9 +147,13 @@ def preexec_function():
 
 
 check_output_logger = logging.getLogger('check_output')
+# Popen is not thread safe. If two threads attempt to call it at the same time,
+# one may lock up. See https://bugs.python.org/issue12739.
+check_output_lock = threading.Lock()
 
 
-def check_output(command, timeout=None, ignore=None, inputtext=None, **kwargs):
+def check_output(command, timeout=None, ignore=None, inputtext=None,
+                 combined_output=False, **kwargs):
     """This is a version of subprocess.check_output that adds a timeout parameter to kill
     the subprocess if it does not return within the specified time."""
     # pylint: disable=too-many-branches
@@ -144,9 +174,14 @@ def check_output(command, timeout=None, ignore=None, inputtext=None, **kwargs):
         except OSError:
             pass  # process may have already terminated.
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               stdin=subprocess.PIPE,
-                               preexec_fn=preexec_function, **kwargs)
+    with check_output_lock:
+        stderr = subprocess.STDOUT if combined_output else subprocess.PIPE
+        process = subprocess.Popen(command,
+                                   stdout=subprocess.PIPE,
+                                   stderr=stderr,
+                                   stdin=subprocess.PIPE,
+                                   preexec_fn=preexec_function,
+                                   **kwargs)
 
     if timeout:
         timer = threading.Timer(timeout, callback, [process.pid, ])
@@ -154,6 +189,11 @@ def check_output(command, timeout=None, ignore=None, inputtext=None, **kwargs):
 
     try:
         output, error = process.communicate(inputtext)
+        if sys.version_info[0] == 3:
+            # Currently errors=replace is needed as 0x8c throws an error
+            output = output.decode(sys.stdout.encoding or 'utf-8', "replace")
+            if error:
+                error = error.decode(sys.stderr.encoding or 'utf-8', "replace")
     finally:
         if timeout:
             timer.cancel()
@@ -161,9 +201,9 @@ def check_output(command, timeout=None, ignore=None, inputtext=None, **kwargs):
     retcode = process.poll()
     if retcode:
         if retcode == -9:  # killed, assume due to timeout callback
-            raise TimeoutError(command, output='\n'.join([output, error]))
+            raise TimeoutError(command, output='\n'.join([output or '', error or '']))
         elif ignore != 'all' and retcode not in ignore:
-            raise subprocess.CalledProcessError(retcode, command, output='\n'.join([output, error]))
+            raise subprocess.CalledProcessError(retcode, command, output='\n'.join([output or '', error or '']))
     return output, error
 
 
@@ -235,8 +275,8 @@ def _merge_two_dicts(base, other, list_duplicates='all', match_types=False,  # p
                      dict_type=dict, should_normalize=True, should_merge_lists=True):
     """Merge dicts normalizing their keys."""
     merged = dict_type()
-    base_keys = base.keys()
-    other_keys = other.keys()
+    base_keys = list(base.keys())
+    other_keys = list(other.keys())
     norm = normalize if should_normalize else lambda x, y: x
 
     base_only = []
@@ -368,7 +408,7 @@ def normalize(value, dict_type=dict):
     no surrounding whitespace, underscore-delimited strings."""
     if isinstance(value, dict):
         normalized = dict_type()
-        for k, v in value.iteritems():
+        for k, v in value.items():
             key = k.strip().lower().replace(' ', '_')
             normalized[key] = normalize(v, dict_type)
         return normalized
@@ -384,27 +424,58 @@ def convert_new_lines(text):
     """ Convert new lines to a common format.  """
     return text.replace('\r\n', '\n').replace('\r', '\n')
 
+def sanitize_cmd_template(cmd):
+    msg = (
+        '''Quoted placeholder should not be used, as it will result in quoting the text twice. {} should be used instead of '{}' or "{}" in the template: '''
+    )
+    for unwanted in ('"{}"', "'{}'"):
+        if unwanted in cmd:
+            warnings.warn(msg + cmd, stacklevel=2)
+            cmd = cmd.replace(unwanted, '{}')
+
+    return cmd
 
 def escape_quotes(text):
-    """Escape quotes, and escaped quotes, in the specified text."""
+    """
+    Escape quotes, and escaped quotes, in the specified text.
+
+    .. note:: :func:`pipes.quote` should be favored where possible.
+    """
     return re.sub(r'\\("|\')', r'\\\\\1', text).replace('\'', '\\\'').replace('\"', '\\\"')
 
 
 def escape_single_quotes(text):
-    """Escape single quotes, and escaped single quotes, in the specified text."""
+    """
+    Escape single quotes, and escaped single quotes, in the specified text.
+
+    .. note:: :func:`pipes.quote` should be favored where possible.
+    """
     return re.sub(r'\\("|\')', r'\\\\\1', text).replace('\'', '\'\\\'\'')
 
 
 def escape_double_quotes(text):
-    """Escape double quotes, and escaped double quotes, in the specified text."""
+    """
+    Escape double quotes, and escaped double quotes, in the specified text.
+
+    .. note:: :func:`pipes.quote` should be favored where possible.
+    """
     return re.sub(r'\\("|\')', r'\\\\\1', text).replace('\"', '\\\"')
+
+
+def escape_spaces(text):
+    """
+    Escape spaces in the specified text
+
+    .. note:: :func:`pipes.quote` should be favored where possible.
+    """
+    return text.replace(' ', '\ ')
 
 
 def getch(count=1):
     """Read ``count`` characters from standard input."""
     if os.name == 'nt':
         import msvcrt  # pylint: disable=F0401
-        return ''.join([msvcrt.getch() for _ in xrange(count)])
+        return ''.join([msvcrt.getch() for _ in range(count)])
     else:  # assume Unix
         import tty  # NOQA
         import termios  # NOQA
@@ -429,6 +500,19 @@ def as_relative(path):
     the equivant on other platforms."""
     path = os.path.splitdrive(path)[1]
     return path.lstrip(os.sep)
+
+
+def commonprefix(file_list, sep=os.sep):
+    """
+    Find the lowest common base folder of a passed list of files.
+    """
+    common_path = os.path.commonprefix(file_list)
+    cp_split = common_path.split(sep)
+    other_split = file_list[0].split(sep)
+    last = len(cp_split) - 1
+    if cp_split[last] != other_split[last]:
+        cp_split = cp_split[:-1]
+    return sep.join(cp_split)
 
 
 def get_cpu_mask(cores):
@@ -460,8 +544,8 @@ def which(name):
             return None
 
 
-_bash_color_regex = re.compile('\x1b\\[[0-9;]+m')
-
+# This matches most ANSI escape sequences, not just colors
+_bash_color_regex = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 def strip_bash_colors(text):
     return _bash_color_regex.sub('', text)
@@ -469,10 +553,16 @@ def strip_bash_colors(text):
 
 def get_random_string(length):
     """Returns a random ASCII string of the specified length)."""
-    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in xrange(length))
+    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
 
 
 class LoadSyntaxError(Exception):
+
+    @property
+    def message(self):
+        if self.args:
+            return self.args[0]
+        return str(self)
 
     def __init__(self, message, filepath, lineno):
         super(LoadSyntaxError, self).__init__(message)
@@ -486,13 +576,19 @@ class LoadSyntaxError(Exception):
 
 RAND_MOD_NAME_LEN = 30
 BAD_CHARS = string.punctuation + string.whitespace
-TRANS_TABLE = string.maketrans(BAD_CHARS, '_' * len(BAD_CHARS))
+# pylint: disable=no-member
+if sys.version_info[0] == 3:
+    TRANS_TABLE = str.maketrans(BAD_CHARS, '_' * len(BAD_CHARS))
+else:
+    TRANS_TABLE = string.maketrans(BAD_CHARS, '_' * len(BAD_CHARS))
 
 
 def to_identifier(text):
     """Converts text to a valid Python identifier by replacing all
-    whitespace and punctuation."""
-    return re.sub('_+', '_', text.translate(TRANS_TABLE))
+    whitespace and punctuation and adding a prefix if starting with a digit"""
+    if text[:1].isdigit():
+        text = '_' + text
+    return re.sub('_+', '_', str(text).translate(TRANS_TABLE))
 
 
 def unique(alist):
@@ -513,8 +609,8 @@ def ranges_to_list(ranges_string):
     values = []
     for rg in ranges_string.split(','):
         if '-' in rg:
-            first, last = map(int, rg.split('-'))
-            values.extend(xrange(first, last + 1))
+            first, last = list(map(int, rg.split('-')))
+            values.extend(range(first, last + 1))
         else:
             values.append(int(rg))
     return values
@@ -523,8 +619,8 @@ def ranges_to_list(ranges_string):
 def list_to_ranges(values):
     """Converts a list, e.g ``[0,2,3,4]``, into a sysfs-style ranges string, e.g. ``"0,2-4"``"""
     range_groups = []
-    for _, g in groupby(enumerate(values), lambda (i, x): i - x):
-        range_groups.append(map(itemgetter(1), g))
+    for _, g in groupby(enumerate(values), lambda i_x: i_x[0] - i_x[1]):
+        range_groups.append(list(map(itemgetter(1), g)))
     range_strings = []
     for group in range_groups:
         if len(group) == 1:
@@ -547,7 +643,7 @@ def mask_to_list(mask):
     """Converts the specfied integer bitmask into a list of
     indexes of bits that are set in the mask."""
     size = len(bin(mask)) - 2  # because of "0b"
-    return [size - i - 1 for i in xrange(size)
+    return [size - i - 1 for i in range(size)
             if mask & (1 << size - i - 1)]
 
 
@@ -585,17 +681,40 @@ def __get_memo_id(obj):
 
 
 @wrapt.decorator
-def memoized(wrapped, instance, args, kwargs):
-    """A decorator for memoizing functions and methods."""
+def memoized(wrapped, instance, args, kwargs):  # pylint: disable=unused-argument
+    """
+    A decorator for memoizing functions and methods.
+
+    .. warning:: this may not detect changes to mutable types. As long as the
+                 memoized function was used with an object as an argument
+                 before, the cached result will be returned, even if the
+                 structure of the object (e.g. a list) has changed in the mean time.
+
+    """
     func_id = repr(wrapped)
 
     def memoize_wrapper(*args, **kwargs):
         id_string = func_id + ','.join([__get_memo_id(a) for a in  args])
-        id_string += ','.join('{}={}'.format(k, v)
-                              for k, v in kwargs.iteritems())
+        id_string += ','.join('{}={}'.format(k, __get_memo_id(v))
+                              for k, v in kwargs.items())
         if id_string not in __memo_cache:
             __memo_cache[id_string] = wrapped(*args, **kwargs)
         return __memo_cache[id_string]
 
     return memoize_wrapper(*args, **kwargs)
 
+@contextmanager
+def batch_contextmanager(f, kwargs_list):
+    """
+    Return a context manager that will call the ``f`` callable with the keyword
+    arguments dict in the given list, in one go.
+
+    :param f: Callable expected to return a context manager.
+
+    :param kwargs_list: list of kwargs dictionaries to be used to call ``f``.
+    :type kwargs_list: list(dict)
+    """
+    with ExitStack() as stack:
+        for kwargs in kwargs_list:
+            stack.enter_context(f(**kwargs))
+        yield

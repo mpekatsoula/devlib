@@ -1,11 +1,13 @@
 Overview
 ========
 
-A :class:`Target` instance serves as the main interface to the target device. 
-There currently three target interfaces:
+A :class:`Target` instance serves as the main interface to the target device.
+There are currently four target interfaces:
 
 - :class:`LinuxTarget` for interacting with Linux devices over SSH.
-- :class:`AndroidTraget` for interacting with Android devices over adb.
+- :class:`AndroidTarget` for interacting with Android devices over adb.
+- :class:`ChromeOsTarget`: for interacting with ChromeOS devices over SSH, and
+                           their Android containers over adb.
 - :class:`LocalLinuxTarget`: for interacting with the local Linux host.
 
 They all work in more-or-less the same way, with the major difference being in
@@ -20,7 +22,7 @@ Acquiring a Target
 To create an interface to your device, you just need to instantiate one of the
 :class:`Target` derivatives listed above, and pass it the right
 ``connection_settings``. Code snippet below gives a typical example of
-instantiating each of the three target types. 
+instantiating each of the three target types.
 
 .. code:: python
 
@@ -37,6 +39,7 @@ instantiating each of the three target types.
                                         'password': 'sekrit',
                                         # or
                                         'keyfile': '/home/me/.ssh/id_rsa'})
+   # ChromeOsTarget connection is performed in the same way as LinuxTarget
 
    # For an Android target, you will need to pass the device name as reported
    # by "adb devices". If there is only one device visible to adb, you can omit
@@ -74,13 +77,19 @@ This sets up the target for ``devlib`` interaction. This includes creating
 working directories, deploying busybox, etc. It's usually enough to do this once
 for a new device, as the changes this makes will persist across reboots.
 However, there is no issue with calling this multiple times, so, to be on the
-safe site, it's a good idea to call this once at the beginning of your scripts.
+safe side, it's a good idea to call this once at the beginning of your scripts.
 
 Command Execution
 ~~~~~~~~~~~~~~~~~
 
-There are several ways to execute a command on the target. In each case, a
-:class:`TargetError` will be raised if something goes wrong. In very case, it is
+There are several ways to execute a command on the target. In each case, an
+instance of a subclass of :class:`TargetError` will be raised if something goes
+wrong. When a transient error is encountered such as the loss of the network
+connectivity, it will raise a :class:`TargetTransientError`. When the command
+fails, it will raise a :class:`TargetStableError` unless the
+``will_succeed=True`` parameter is specified, in which case a
+:class:`TargetTransientError` will be raised since it is assumed that the
+command cannot fail unless there is an environment issue. In each case, it is
 also possible to specify ``as_root=True`` if the specified command should be
 executed as root.
 
@@ -89,7 +98,7 @@ executed as root.
    from devlib import LocalLinuxTarget
    t = LocalLinuxTarget()
 
-   # Execute a command 
+   # Execute a command
    output = t.execute('echo $PWD')
 
    # Execute command via a subprocess and return the corresponding Popen object.
@@ -100,7 +109,7 @@ executed as root.
 
    # Run the command in the background on the device and return immediately.
    # This will not block the connection, allowing to immediately execute another
-   # command. 
+   # command.
    t.kick_off('echo $PWD')
 
    # This is used to invoke an executable binary on the device. This allows some
@@ -125,7 +134,7 @@ File Transfer
    t.pull('/path/to/target/file.txt', '/path/to/local/file.txt')
 
    # Install the specified binary on the target. This will deploy the file and
-   # ensure it's executable. This will *not* guarantee that the binary will be 
+   # ensure it's executable. This will *not* guarantee that the binary will be
    # in PATH. Instead the path to the binary will be returned; this should be
    # used to call the binary henceforth.
    target_bin = t.install('/path/to/local/bin.exe')
@@ -133,7 +142,7 @@ File Transfer
    output = t.execute('{} --some-option'.format(target_bin))
 
 The usual access permission constraints on the user account (both on the target
-and the host) apply. 
+and the host) apply.
 
 Process Control
 ~~~~~~~~~~~~~~~
@@ -154,7 +163,7 @@ Process Control
    # kill all running instances of a process.
    t.killall('badexe', signal=signal.SIGKILL)
 
-   # List processes running on the target. This retruns a list of parsed
+   # List processes running on the target. This returns a list of parsed
    # PsEntry records.
    entries = t.ps()
    # e.g.  print virtual memory sizes of all running sshd processes:
@@ -173,7 +182,7 @@ Super User Privileges
 
 It is not necessary for the account logged in on the target to have super user
 privileges, however the functionality will obviously be diminished, if that is
-not the case. ``devilib`` will determine if the logged in user has root
+not the case. ``devlib`` will determine if the logged in user has root
 privileges and the correct way to invoke it. You should avoid including "sudo"
 directly in your commands, instead, specify ``as_root=True`` where needed. This
 will make your scripts portable across multiple devices and OS's.
@@ -193,7 +202,7 @@ working_directory
         by your script on the device and as the destination for all
         host-to-target file transfers. It may or may not permit execution so
         executables should not be run directly from here.
-        
+
 executables_directory
         This directory allows execution. This will be used by ``install()``.
 
@@ -211,6 +220,66 @@ executables_directory
    # Since working_directory is a common base path for on-target locations,
    # there a short-hand for the above:
    t.push('/local/path/to/assets.tar.gz', t.get_workpath('assets.tar.gz'))
+
+
+Exceptions Handling
+-------------------
+
+Devlib custom exceptions all derive from :class:`DevlibError`. Some exceptions
+are further categorized into :class:`DevlibTransientError` and
+:class:`DevlibStableError`. Transient errors are raised when there is an issue
+in the environment that can happen randomly such as the loss of network
+connectivity. Even a properly configured environment can be subject to such
+transient errors. Stable errors are related to either programming errors or
+configuration issues in the broad sense. This distinction allows quicker
+analysis of failures, since most transient errors can be ignored unless they
+happen at an alarming rate. :class:`DevlibTransientError` usually propagates up
+to the caller of devlib APIs, since it means that an operation could not
+complete. Retrying it or bailing out is therefore a responsability of the caller.
+
+The hierarchy is as follows:
+
+- :class:`DevlibError`
+   
+   - :class:`WorkerThreadError`
+   - :class:`HostError`
+   - :class:`TargetError`
+      
+      - :class:`TargetStableError`
+      - :class:`TargetTransientError`
+      - :class:`TargetNotRespondingError`
+   
+   - :class:`DevlibStableError`
+      
+      - :class:`TargetStableError`
+
+   - :class:`DevlibTransientError`
+
+      - :class:`TimeoutError`
+      - :class:`TargetTransientError`
+      - :class:`TargetNotRespondingError`
+
+
+Extending devlib
+~~~~~~~~~~~~~~~~
+
+New devlib code is likely to face the decision of raising a transient or stable
+error. When it is unclear which one should be used, it can generally be assumed
+that the system is properly configured and therefore, the error is linked to an
+environment transient failure. If a function is somehow probing a property of a
+system in the broad meaning, it can use a stable error as a way to signal a
+non-expected value of that property even if it can also face transient errors.
+An example are the various ``execute()`` methods where the command can generally
+not be assumed to be supposed to succeed by devlib. Their failure does not
+usually come from an environment random issue, but for example a permission
+error. The user can use such expected failure to probe the system. Another
+example is boot completion detection on Android: boot failure cannot be
+distinguished from a timeout which is too small. A non-transient exception is
+still raised, since assuming the timeout comes from a network failure would
+either make the function useless, or force the calling code to handle a
+transient exception under normal operation. The calling code would potentially
+wrongly catch transient exceptions raised by other functions as well and attach
+a wrong meaning to them.
 
 
 Modules
@@ -249,22 +318,19 @@ You can collected traces (currently, just ftrace) using
 
    from devlib import AndroidTarget, FtraceCollector
    t = LocalLinuxTarget()
-  
+
    # Initialize a collector specifying the events you want to collect and
    # the buffer size to be used.
    trace = FtraceCollector(t, events=['power*'], buffer_size=40000)
 
-   # clear ftrace buffer
-   trace.reset()
-
-   # start trace collection
-   trace.start()
-
-   # Perform the operations you want to trace here...
-   import time; time.sleep(5)
-
-   # stop trace collection
-   trace.stop()
+   # As a context manager, clear ftrace buffer using trace.reset(),
+   # start trace collection using trace.start(), then stop it Using
+   # trace.stop(). Using a context manager brings the guarantee that
+   # tracing will stop even if an exception occurs, including 
+   # KeyboardInterrupt (ctr-C) and SystemExit (sys.exit)
+   with trace:
+      # Perform the operations you want to trace here...
+      import time; time.sleep(5)
 
    # extract the trace file from the target into a local file
    trace.get_trace('/tmp/trace.bin')

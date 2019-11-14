@@ -1,4 +1,4 @@
-#    Copyright 2013-2015 ARM Limited
+#    Copyright 2013-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,34 @@
 
 class DevlibError(Exception):
     """Base class for all Devlib exceptions."""
+
+    def __init__(self, *args):
+        message = args[0] if args else None
+        self._message = message
+
+    @property
+    def message(self):
+        if self._message is not None:
+            return self._message
+        else:
+            return str(self)
+
+
+class DevlibStableError(DevlibError):
+    """Non transient target errors, that are not subject to random variations
+    in the environment and can be reliably linked to for example a missing
+    feature on a target."""
+    pass
+
+
+class DevlibTransientError(DevlibError):
+    """Exceptions inheriting from ``DevlibTransientError`` represent random
+    transient events that are usually related to issues in the environment, as
+    opposed to programming errors, for example network failures or
+    timeout-related exceptions. When the error could come from
+    indistinguishable transient or non-transient issue, it can generally be
+    assumed that the configuration is correct and therefore, a transient
+    exception is raised."""
     pass
 
 
@@ -23,11 +51,22 @@ class TargetError(DevlibError):
     pass
 
 
-class TargetNotRespondingError(DevlibError):
-    """The target is unresponsive."""
+class TargetTransientError(TargetError, DevlibTransientError):
+    """Transient target errors that can happen randomly when everything is
+    properly configured."""
+    pass
 
-    def __init__(self, target):
-        super(TargetNotRespondingError, self).__init__('Target {} is not responding.'.format(target))
+
+class TargetStableError(TargetError, DevlibStableError):
+    """Non-transient target errors that can be linked to a programming error or
+    a configuration issue, and is not influenced by non-controllable parameters
+    such as network issues."""
+    pass
+
+
+class TargetNotRespondingError(TargetTransientError):
+    """The target is unresponsive."""
+    pass
 
 
 class HostError(DevlibError):
@@ -35,7 +74,8 @@ class HostError(DevlibError):
     pass
 
 
-class TimeoutError(DevlibError):
+# pylint: disable=redefined-builtin
+class TimeoutError(DevlibTransientError):
     """Raised when a subprocess command times out. This is basically a ``DevlibError``-derived version
     of ``subprocess.CalledProcessError``, the thinking being that while a timeout could be due to
     programming error (e.g. not setting long enough timers), it is often due to some failure in the
@@ -71,19 +111,29 @@ class WorkerThreadError(DevlibError):
         super(WorkerThreadError, self).__init__(message)
 
 
+class KernelConfigKeyError(KeyError, IndexError, DevlibError):
+    """
+    Exception raised when a kernel config option cannot be found.
+
+    It inherits from :exc:`IndexError` for backward compatibility, and
+    :exc:`KeyError` to behave like a regular mapping.
+    """
+    pass
+
+
 def get_traceback(exc=None):
     """
     Returns the string with the traceback for the specifiec exc
     object, or for the current exception exc is not specified.
 
     """
-    import StringIO, traceback, sys
+    import io, traceback, sys  # pylint: disable=multiple-imports
     if exc is None:
         exc = sys.exc_info()
     if not exc:
         return None
     tb = exc[2]
-    sio = StringIO.StringIO()
+    sio = io.BytesIO()
     traceback.print_tb(tb, file=sio)
     del tb  # needs to be done explicitly see: http://docs.python.org/2/library/sys.html#sys.exc_info
     return sio.getvalue()

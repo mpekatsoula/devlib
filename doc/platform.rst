@@ -18,17 +18,17 @@ it was not specified explicitly by the user.
     :param core_names: A list of CPU core names in the order they appear
                        registered with the OS. If they are not specified,
                        they will be queried at run time.
-    :param core_clusters: Alist with cluster ids of each core (starting with
+    :param core_clusters: A list with cluster ids of each core (starting with
                           0). If this is not specified, clusters will be
                           inferred from core names (cores with the same name are
                           assumed to be in a cluster).
     :param big_core: The name of the big core in a big.LITTLE system. If this is
-                     not specified it will be inferred (on systems with exactly 
-                     two clasters).
+                     not specified it will be inferred (on systems with exactly
+                     two clusters).
     :param model: Model name of the hardware system. If this is not specified it
                   will be queried at run time.
     :param modules: Modules with additional functionality supported by the
-                    platfrom (e.g. for handling flashing, rebooting, etc). These
+                    platform (e.g. for handling flashing, rebooting, etc). These
                     would be added to the Target's modules. (See :ref:`modules`\ ).
 
 
@@ -38,13 +38,13 @@ Versatile Express
 The generic platform may be extended to support hardware- or
 infrastructure-specific functionality. Platforms exist for ARM
 VersatileExpress-based :class:`Juno` and :class:`TC2` development boards. In
-addition to the standard :class:`Platform` parameters above, these platfroms
+addition to the standard :class:`Platform` parameters above, these platforms
 support additional configuration:
 
 
 .. class:: VersatileExpressPlatform
 
-    Normally, this would be instatiated via one of its derived classes
+    Normally, this would be instantiated via one of its derived classes
     (:class:`Juno` or :class:`TC2`) that set appropriate defaults for some of
     the parameters.
 
@@ -63,7 +63,7 @@ support additional configuration:
                         mounted on the host system.
     :param hard_reset_method: Specifies the method for hard-resetting the devices
                             (e.g. if it becomes unresponsive and normal reboot
-                            method doesn not work). Currently supported methods
+                            method doesn't not work). Currently supported methods
                             are:
 
                             :dtr: reboot by toggling DTR line on the serial
@@ -80,15 +80,15 @@ support additional configuration:
                       The following values are currently supported:
 
                        :uefi: Boot via UEFI menu, by selecting the entry
-                              specified by ``uefi_entry`` paramter. If this
+                              specified by ``uefi_entry`` parameter. If this
                               entry does not exist, it will be automatically
                               created based on values provided for ``image``,
                               ``initrd``, ``fdt``, and ``bootargs`` parameters.
                        :uefi-shell: Boot by going via the UEFI shell.
                        :u-boot: Boot using Das U-Boot.
                        :bootmon: Boot directly via Versatile Express Bootmon
-                                 using the values provided for ``image``, 
-                                 ``initrd``, ``fdt``, and ``bootargs`` 
+                                 using the values provided for ``image``,
+                                 ``initrd``, ``fdt``, and ``bootargs``
                                  parameters.
 
                       This defaults to ``u-boot`` for :class:`Juno` and

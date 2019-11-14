@@ -1,4 +1,4 @@
-#    Copyright 2015 ARM Limited
+#    Copyright 2015-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,15 +14,17 @@
 #
 from __future__ import division
 import os
+import sys
 import tempfile
-import csv
 import time
 import pexpect
 
-from devlib.platform import Platform
-from devlib.instrument import Instrument, InstrumentChannel, MeasurementsCsv, Measurement,  CONTINUOUS,  INSTANTANEOUS
-from devlib.exception import TargetError, HostError
+from devlib.exception import HostError, TargetTransientError
 from devlib.host import PACKAGE_BIN_DIRECTORY
+from devlib.instrument import (Instrument, InstrumentChannel, MeasurementsCsv,
+                               Measurement, CONTINUOUS, INSTANTANEOUS)
+from devlib.platform import Platform
+from devlib.utils.csvutil import csvreader, csvwriter
 from devlib.utils.serial_port import open_serial_connection
 
 
@@ -33,6 +35,7 @@ class VersatileExpressPlatform(Platform):
                  core_names=None,
                  core_clusters=None,
                  big_core=None,
+                 model=None,
                  modules=None,
 
                  # serial settings
@@ -61,6 +64,7 @@ class VersatileExpressPlatform(Platform):
                                                        core_names,
                                                        core_clusters,
                                                        big_core,
+                                                       model,
                                                        modules)
         self.serial_port = serial_port
         self.baudrate = baudrate
@@ -86,6 +90,9 @@ class VersatileExpressPlatform(Platform):
     def _init_android_target(self, target):
         if target.connection_settings.get('device') is None:
             addr = self._get_target_ip_address(target)
+            if sys.version_info[0] == 3:
+                # Convert bytes to string for Python3 compatibility
+                addr = addr.decode("utf-8")
             target.connection_settings['device'] = addr + ':5555'
 
     def _init_linux_target(self, target):
@@ -93,27 +100,32 @@ class VersatileExpressPlatform(Platform):
             addr = self._get_target_ip_address(target)
             target.connection_settings['host'] = addr
 
+    # pylint: disable=no-member
     def _get_target_ip_address(self, target):
         with open_serial_connection(port=self.serial_port,
                                     baudrate=self.baudrate,
                                     timeout=30,
                                     init_dtr=0) as tty:
-            tty.sendline('')
+            tty.sendline('su')  # this is, apprently, required to query network device
+                                # info by name on recent Juno builds...
             self.logger.debug('Waiting for the Android shell prompt.')
             tty.expect(target.shell_prompt)
 
             self.logger.debug('Waiting for IP address...')
             wait_start_time = time.time()
-            while True:
-                tty.sendline('ip addr list eth0')
-                time.sleep(1)
-                try:
-                    tty.expect(r'inet ([1-9]\d*.\d+.\d+.\d+)', timeout=10)
-                    return tty.match.group(1)
-                except pexpect.TIMEOUT:
-                    pass  # We have our own timeout -- see below.
-                if (time.time() - wait_start_time) > self.ready_timeout:
-                    raise TargetError('Could not acquire IP address.')
+            try:
+                while True:
+                    tty.sendline('ip addr list eth0')
+                    time.sleep(1)
+                    try:
+                        tty.expect(r'inet ([1-9]\d*.\d+.\d+.\d+)', timeout=10)
+                        return tty.match.group(1)
+                    except pexpect.TIMEOUT:
+                        pass  # We have our own timeout -- see below.
+                    if (time.time() - wait_start_time) > self.ready_timeout:
+                        raise TargetTransientError('Could not acquire IP address.')
+            finally:
+                tty.sendline('exit')  # exit shell created by "su" call at the start
 
     def _set_hard_reset_method(self, hard_reset_method):
         if hard_reset_method == 'dtr':
@@ -210,22 +222,22 @@ class JunoEnergyInstrument(Instrument):
     mode = CONTINUOUS | INSTANTANEOUS
 
     _channels = [
-        InstrumentChannel('sys_curr', 'sys', 'current'),
-        InstrumentChannel('a57_curr', 'a57', 'current'),
-        InstrumentChannel('a53_curr', 'a53', 'current'),
-        InstrumentChannel('gpu_curr', 'gpu', 'current'),
-        InstrumentChannel('sys_volt', 'sys', 'voltage'),
-        InstrumentChannel('a57_volt', 'a57', 'voltage'),
-        InstrumentChannel('a53_volt', 'a53', 'voltage'),
-        InstrumentChannel('gpu_volt', 'gpu', 'voltage'),
-        InstrumentChannel('sys_pow', 'sys', 'power'),
-        InstrumentChannel('a57_pow', 'a57', 'power'),
-        InstrumentChannel('a53_pow', 'a53', 'power'),
-        InstrumentChannel('gpu_pow', 'gpu', 'power'),
-        InstrumentChannel('sys_cenr', 'sys', 'energy'),
-        InstrumentChannel('a57_cenr', 'a57', 'energy'),
-        InstrumentChannel('a53_cenr', 'a53', 'energy'),
-        InstrumentChannel('gpu_cenr', 'gpu', 'energy'),
+        InstrumentChannel('sys', 'current'),
+        InstrumentChannel('a57', 'current'),
+        InstrumentChannel('a53', 'current'),
+        InstrumentChannel('gpu', 'current'),
+        InstrumentChannel('sys', 'voltage'),
+        InstrumentChannel('a57', 'voltage'),
+        InstrumentChannel('a53', 'voltage'),
+        InstrumentChannel('gpu', 'voltage'),
+        InstrumentChannel('sys', 'power'),
+        InstrumentChannel('a57', 'power'),
+        InstrumentChannel('a53', 'power'),
+        InstrumentChannel('gpu', 'power'),
+        InstrumentChannel('sys', 'energy'),
+        InstrumentChannel('a57', 'energy'),
+        InstrumentChannel('a53', 'energy'),
+        InstrumentChannel('gpu', 'energy'),
     ]
 
     def __init__(self, target):
@@ -240,12 +252,14 @@ class JunoEnergyInstrument(Instrument):
         self.command = '{} -o {}'.format(self.binary, self.on_target_file)
         self.command2 = '{}'.format(self.binary)
 
-    def setup(self):
+    def setup(self):  # pylint: disable=arguments-differ
         self.binary = self.target.install(os.path.join(PACKAGE_BIN_DIRECTORY,
                                                        self.target.abi, self.binname))
+        self.command = '{} -o {}'.format(self.binary, self.on_target_file)
+        self.command2 = '{}'.format(self.binary)
 
-    def reset(self, sites=None, kinds=None):
-        super(JunoEnergyInstrument, self).reset(sites, kinds)
+    def reset(self, sites=None, kinds=None, channels=None):
+        super(JunoEnergyInstrument, self).reset(sites, kinds, channels)
         self.target.killall(self.binname, as_root=True)
 
     def start(self):
@@ -254,14 +268,14 @@ class JunoEnergyInstrument(Instrument):
     def stop(self):
         self.target.killall(self.binname, signal='TERM', as_root=True)
 
+    # pylint: disable=arguments-differ
     def get_data(self, output_file):
         temp_file = tempfile.mktemp()
         self.target.pull(self.on_target_file, temp_file)
         self.target.remove(self.on_target_file)
 
-        with open(temp_file, 'rb') as fh:
-            reader = csv.reader(fh)
-            headings = reader.next()
+        with csvreader(temp_file) as reader:
+            headings = next(reader)
 
             # Figure out which columns from the collected csv we actually want
             select_columns = []
@@ -271,25 +285,23 @@ class JunoEnergyInstrument(Instrument):
                 except ValueError:
                     raise HostError('Channel "{}" is not in {}'.format(chan.name, temp_file))
 
-            with open(output_file, 'wb') as wfh:
+            with csvwriter(output_file) as writer:
                 write_headings = ['{}_{}'.format(c.site, c.kind)
                                   for c in self.active_channels]
-                writer = csv.writer(wfh)
                 writer.writerow(write_headings)
                 for row in reader:
                     write_row = [row[c] for c in select_columns]
                     writer.writerow(write_row)
 
-        return MeasurementsCsv(output_file, self.active_channels)
+        return MeasurementsCsv(output_file, self.active_channels, sample_rate_hz=10)
 
     def take_measurement(self):
         result = []
         output = self.target.execute(self.command2).split()
-        reader=csv.reader(output)
-        headings=reader.next()
-        values = reader.next()
-        for chan in self.active_channels:
-            value = values[headings.index(chan.name)]
-            result.append(Measurement(value, chan))
+        with csvreader(output) as reader:
+            headings = next(reader)
+            values = next(reader)
+            for chan in self.active_channels:
+                value = values[headings.index(chan.name)]
+                result.append(Measurement(value, chan))
         return result
-

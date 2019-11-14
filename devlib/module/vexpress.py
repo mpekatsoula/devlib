@@ -1,5 +1,5 @@
 #
-#    Copyright 2015 ARM Limited
+#    Copyright 2015-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,15 +17,17 @@ import os
 import time
 import tarfile
 import shutil
+from subprocess import CalledProcessError
 
 from devlib.module import HardRestModule, BootModule, FlashModule
-from devlib.exception import TargetError, HostError
+from devlib.exception import TargetError, TargetStableError, HostError
 from devlib.utils.serial_port import open_serial_connection, pulse_dtr, write_characters
 from devlib.utils.uefi import UefiMenu, UefiConfig
 from devlib.utils.uboot import UbootMenu
 
 
-AUTOSTART_MESSAGE = 'Press Enter to stop auto boot...'
+OLD_AUTOSTART_MESSAGE = 'Press Enter to stop auto boot...'
+AUTOSTART_MESSAGE = 'Hit any key to stop autoboot:'
 POWERUP_MESSAGE = 'Powering up system...'
 DEFAULT_MCC_PROMPT = 'Cmd>'
 
@@ -51,7 +53,7 @@ class VexpressDtrHardReset(HardRestModule):
         try:
             if self.target.is_connected:
                 self.target.execute('sync')
-        except TargetError:
+        except (TargetError, CalledProcessError):
             pass
         with open_serial_connection(port=self.port,
                                     baudrate=self.baudrate,
@@ -87,7 +89,7 @@ class VexpressReboottxtHardReset(HardRestModule):
         try:
             if self.target.is_connected:
                 self.target.execute('sync')
-        except TargetError:
+        except (TargetError, CalledProcessError):
             pass
 
         if not os.path.exists(self.path):
@@ -136,18 +138,20 @@ class VexpressBootModule(BootModule):
     def get_through_early_boot(self, tty):
         self.logger.debug('Establishing initial state...')
         tty.sendline('')
-        i = tty.expect([AUTOSTART_MESSAGE, POWERUP_MESSAGE, self.mcc_prompt])
-        if i == 2:
+        i = tty.expect([AUTOSTART_MESSAGE, OLD_AUTOSTART_MESSAGE, POWERUP_MESSAGE, self.mcc_prompt])
+        if i == 3:
             self.logger.debug('Saw MCC prompt.')
             time.sleep(self.short_delay)
             tty.sendline('reboot')
-        elif i == 1:
+        elif i == 2:
             self.logger.debug('Saw powering up message (assuming soft reboot).')
         else:
             self.logger.debug('Saw auto boot message.')
             tty.sendline('')
             time.sleep(self.short_delay)
+            # could be either depending on where in the boot we are
             tty.sendline('reboot')
+            tty.sendline('reset')
 
     def get_uefi_menu(self, tty):
         menu = UefiMenu(tty)
@@ -205,6 +209,7 @@ class VexpressUefiShellBoot(VexpressBootModule):
 
     name = 'vexpress-uefi-shell'
 
+    # pylint: disable=keyword-arg-before-vararg
     def __init__(self, target, uefi_entry='^Shell$',
                  efi_shell_prompt='Shell>',
                  image='kernel', bootargs=None,
@@ -220,7 +225,7 @@ class VexpressUefiShellBoot(VexpressBootModule):
         try:
             menu.select(self.uefi_entry)
         except LookupError:
-            raise TargetError('Did not see "{}" UEFI entry.'.format(self.uefi_entry))
+            raise TargetStableError('Did not see "{}" UEFI entry.'.format(self.uefi_entry))
         tty.expect(self.efi_shell_prompt, timeout=self.timeout)
         if self.bootargs:
             tty.sendline('')  # stop default boot
@@ -235,6 +240,7 @@ class VexpressUBoot(VexpressBootModule):
 
     name = 'vexpress-u-boot'
 
+    # pylint: disable=keyword-arg-before-vararg
     def __init__(self, target, env=None,
                  *args, **kwargs):
         super(VexpressUBoot, self).__init__(target, *args, **kwargs)
@@ -247,7 +253,7 @@ class VexpressUBoot(VexpressBootModule):
         menu = UbootMenu(tty)
         self.logger.debug('Waiting for U-Boot prompt...')
         menu.open(timeout=120)
-        for var, value in self.env.iteritems():
+        for var, value in self.env.items():
             menu.setenv(var, value)
         menu.boot()
 
@@ -256,6 +262,7 @@ class VexpressBootmon(VexpressBootModule):
 
     name = 'vexpress-bootmon'
 
+    # pylint: disable=keyword-arg-before-vararg
     def __init__(self, target,
                  image, fdt, initrd, bootargs,
                  uses_bootscript=False,
@@ -278,11 +285,11 @@ class VexpressBootmon(VexpressBootModule):
         with open_serial_connection(port=self.port,
                                     baudrate=self.baudrate,
                                     timeout=self.timeout,
-                                    init_dtr=0) as tty:
-            write_characters(tty, 'fl linux fdt {}'.format(self.fdt))
-            write_characters(tty, 'fl linux initrd {}'.format(self.initrd))
-            write_characters(tty, 'fl linux boot {} {}'.format(self.image,
-                                                               self.bootargs))
+                                    init_dtr=0) as tty_conn:
+            write_characters(tty_conn, 'fl linux fdt {}'.format(self.fdt))
+            write_characters(tty_conn, 'fl linux initrd {}'.format(self.initrd))
+            write_characters(tty_conn, 'fl linux boot {} {}'.format(self.image,
+                                                                    self.bootargs))
 
 
 class VersatileExpressFlashModule(FlashModule):
@@ -324,9 +331,10 @@ class VersatileExpressFlashModule(FlashModule):
                                     baudrate=self.target.platform.baudrate,
                                     timeout=self.timeout,
                                     init_dtr=0) as tty:
-            i = tty.expect([self.mcc_prompt, AUTOSTART_MESSAGE])
+            # pylint: disable=no-member
+            i = tty.expect([self.mcc_prompt, AUTOSTART_MESSAGE, OLD_AUTOSTART_MESSAGE])
             if i:
-                tty.sendline('')
+                tty.sendline('')  # pylint: disable=no-member
             wait_for_vemsd(self.vemsd_mount, tty, self.mcc_prompt, self.short_delay)
         try:
             if image_bundle:
@@ -334,9 +342,9 @@ class VersatileExpressFlashModule(FlashModule):
             if images:
                 self._overlay_images(images)
             os.system('sync')
-        except (IOError, OSError), e:
+        except (IOError, OSError) as e:
             msg = 'Could not deploy images to {}; got: {}'
-            raise TargetError(msg.format(self.vemsd_mount, e))
+            raise TargetStableError(msg.format(self.vemsd_mount, e))
         self.target.boot()
         self.target.connect(timeout=30)
 
@@ -348,7 +356,7 @@ class VersatileExpressFlashModule(FlashModule):
             tar.extractall(self.vemsd_mount)
 
     def _overlay_images(self, images):
-        for dest, src in images.iteritems():
+        for dest, src in images.items():
             dest = os.path.join(self.vemsd_mount, dest)
             self.logger.debug('Copying {} to {}'.format(src, dest))
             shutil.copy(src, dest)
@@ -375,12 +383,11 @@ def wait_for_vemsd(vemsd_mount, tty, mcc_prompt=DEFAULT_MCC_PROMPT, short_delay=
     path = os.path.join(vemsd_mount, 'config.txt')
     if os.path.exists(path):
         return
-    for _ in xrange(attempts):
+    for _ in range(attempts):
         tty.sendline('')  # clear any garbage
         tty.expect(mcc_prompt, timeout=short_delay)
         tty.sendline('usb_on')
         time.sleep(short_delay * 3)
         if os.path.exists(path):
             return
-    raise TargetError('Could not mount {}'.format(vemsd_mount))
-
+    raise TargetStableError('Could not mount {}'.format(vemsd_mount))

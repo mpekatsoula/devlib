@@ -40,7 +40,7 @@ class that implements the following methods.
    :param timeout: timeout (in seconds) for the transfer; if the transfer does
        not  complete within this period, an exception will be raised.
 
-.. method:: execute(self, command, timeout=None, check_exit_code=False, as_root=False)
+.. method:: execute(self, command, timeout=None, check_exit_code=False, as_root=False, strip_colors=True, will_succeed=False)
 
    Execute the specified command on the connected device and return its output.
 
@@ -53,6 +53,13 @@ class that implements the following methods.
        raised if it is not ``0``.
    :param as_root: The command will be executed as root. This will fail on
        unrooted connected devices.
+   :param strip_colours: The command output will have colour encodings and
+       most ANSI escape sequences striped out before returning.
+   :param will_succeed: The command is assumed to always succeed, unless there is
+       an issue in the environment like the loss of network connectivity. That
+       will make the method always raise an instance of a subclass of
+       :class:`DevlibTransientError' when the command fails, instead of a
+       :class:`DevlibStableError`.
 
 .. method:: background(self, command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, as_root=False)
 
@@ -93,25 +100,28 @@ class that implements the following methods.
 Connection Types
 ----------------
 
-.. class:: AdbConnection(device=None, timeout=None)
+.. class:: AdbConnection(device=None, timeout=None, adb_server=None, adb_as_root=False)
 
     A connection to an android device via ``adb`` (Android Debug Bridge).
     ``adb`` is part of the Android SDK (though stand-alone versions are also
     available).
 
-    :param device: The name of the adb divice. This is usually a unique hex
+    :param device: The name of the adb device. This is usually a unique hex
                    string for USB-connected devices, or an ip address/port
                    combination. To see connected devices, you can run ``adb
                    devices`` on the host.
     :param timeout: Connection timeout in seconds. If a connection to the device
-                    is not esblished within this period, :class:`HostError`
+                    is not established within this period, :class:`HostError`
                     is raised.
+    :param adb_server: Allows specifying the address of the adb server to use.
+    :param adb_as_root: Specify whether the adb server should be restarted in root mode.
 
 
 .. class:: SshConnection(host, username, password=None, keyfile=None, port=None,\
-                         timeout=None, password_prompt=None)
+                         timeout=None, password_prompt=None, \
+                         sudo_cmd="sudo -- sh -c {}")
 
-    A connectioned to a device on the network over SSH.
+    A connection to a device on the network over SSH.
 
     :param host: SSH host to which to connect
     :param username: username for SSH login
@@ -126,21 +136,22 @@ Connection Types
                     .. note:: ``keyfile`` and ``password`` can't be specified
                               at the same time.
 
-    :param port: TCP port on which SSH server is litening on the remoted device.
+    :param port: TCP port on which SSH server is listening on the remote device.
                  Omit to use the default port.
     :param timeout: Timeout for the connection in seconds. If a connection
                     cannot be established within this time, an error will be
                     raised.
     :param password_prompt: A string with the password prompt used by
                             ``sshpass``. Set this if your version of ``sshpass``
-                            uses somethin other than ``"[sudo] password"``.
+                            uses something other than ``"[sudo] password"``.
+    :param sudo_cmd: Specify the format of the command used to grant sudo access.
 
 
 .. class:: TelnetConnection(host, username, password=None, port=None,\
                             timeout=None, password_prompt=None,\
                             original_prompt=None)
 
-    A connectioned to a device on the network over Telenet.
+    A connection to a device on the network over Telenet.
 
     .. note:: Since Telenet protocol is does not support file transfer, scp is
               used for that purpose.
@@ -153,19 +164,19 @@ Connection Types
                                ``sshpass`` utility must be installed on the
                                system.
 
-    :param port: TCP port on which SSH server is litening on the remoted device.
+    :param port: TCP port on which SSH server is listening on the remote device.
                  Omit to use the default port.
     :param timeout: Timeout for the connection in seconds. If a connection
                     cannot be established within this time, an error will be
                     raised.
     :param password_prompt: A string with the password prompt used by
                             ``sshpass``. Set this if your version of ``sshpass``
-                            uses somethin other than ``"[sudo] password"``.
+                            uses something other than ``"[sudo] password"``.
     :param original_prompt: A regex for the shell prompted presented in the Telenet
                             connection (the prompt will be reset to a
                             randomly-generated pattern for the duration of the
                             connection to reduce the possibility of clashes).
-                            This paramer is ignored for SSH connections.
+                            This parameter is ignored for SSH connections.
 
 
 .. class:: LocalConnection(keep_password=True, unrooted=False, password=None)
@@ -189,20 +200,19 @@ Connection Types
     A connection to a gem5 simulation using a local Telnet connection.
 
     .. note:: Some of the following input parameters are optional and will be ignored during
-              initialisation. They were kept to keep the anology with a :class:`TelnetConnection`
+              initialisation. They were kept to keep the analogy with a :class:`TelnetConnection`
               (i.e. ``host``, `username``, ``password``, ``port``,
               ``password_prompt`` and ``original_promp``)
 
 
     :param host: Host on which the gem5 simulation is running
 
-                     .. note:: Even thought the input parameter for the ``host``
-                               will be ignored, the gem5 simulation needs to on
-                               the same host as the user as the user is
-                               currently on, so if the host given as input
-                               parameter is not the same as the actual host, a
-                               ``TargetError`` will be raised to prevent
-                               confusion.
+                     .. note:: Even though the input parameter for the ``host``
+                               will be ignored, the gem5 simulation needs to be
+                               on the same host the user is currently on, so if
+                               the host given as input parameter is not the
+                               same as the actual host, a ``TargetStableError``
+                               will be raised to prevent confusion.
 
     :param username: Username in the simulated system
     :param password: No password required in gem5 so does not need to be set
@@ -220,7 +230,7 @@ Connection Types
 There are two classes that inherit from :class:`Gem5Connection`:
 :class:`AndroidGem5Connection` and :class:`LinuxGem5Connection`.
 They inherit *almost* all methods from the parent class, without altering them.
-The only methods discussed belows are those that will be overwritten by the
+The only methods discussed below are those that will be overwritten by the
 :class:`LinuxGem5Connection` and :class:`AndroidGem5Connection` respectively.
 
 .. class:: LinuxGem5Connection

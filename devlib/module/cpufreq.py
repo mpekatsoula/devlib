@@ -1,4 +1,4 @@
-#    Copyright 2014-2015 ARM Limited
+#    Copyright 2014-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,8 +13,9 @@
 # limitations under the License.
 #
 import subprocess
+from contextlib import contextmanager
 from devlib.module import Module
-from devlib.exception import TargetError
+from devlib.exception import TargetStableError
 from devlib.utils.misc import memoized
 
 
@@ -38,7 +39,7 @@ class CpufreqModule(Module):
                 return True
 
         # Generic CPUFreq support (single policy)
-        path = '/sys/devices/system/cpu/cpufreq'
+        path = '/sys/devices/system/cpu/cpufreq/policy0'
         if target.file_exists(path):
             return True
 
@@ -83,7 +84,7 @@ class CpufreqModule(Module):
                Setting the governor on any core in a cluster will also set it on all
                other cores in that cluster.
 
-        :raises: TargetError if governor is not supported by the CPU, or if,
+        :raises: TargetStableError if governor is not supported by the CPU, or if,
                  for some reason, the governor could not be set.
 
         """
@@ -91,10 +92,51 @@ class CpufreqModule(Module):
             cpu = 'cpu{}'.format(cpu)
         supported = self.list_governors(cpu)
         if governor not in supported:
-            raise TargetError('Governor {} not supported for cpu {}'.format(governor, cpu))
+            raise TargetStableError('Governor {} not supported for cpu {}'.format(governor, cpu))
         sysfile = '/sys/devices/system/cpu/{}/cpufreq/scaling_governor'.format(cpu)
         self.target.write_value(sysfile, governor)
         self.set_governor_tunables(cpu, governor, **kwargs)
+
+    @contextmanager
+    def use_governor(self, governor, cpus=None, **kwargs):
+        """
+        Use a given governor, then restore previous governor(s)
+
+        :param governor: Governor to use on all targeted CPUs (see :meth:`set_governor`)
+        :type governor: str
+
+        :param cpus: CPUs affected by the governor change (all by default)
+        :type cpus: list
+
+        :Keyword Arguments: Governor tunables, See :meth:`set_governor_tunables`
+        """
+        if not cpus:
+            cpus = self.target.list_online_cpus()
+
+        # Setting a governor & tunables for a cpu will set them for all cpus
+        # in the same clock domain, so only manipulating one cpu per domain
+        # is enough
+        domains = set(self.get_affected_cpus(cpu)[0] for cpu in cpus)
+        prev_governors = {cpu : (self.get_governor(cpu), self.get_governor_tunables(cpu))
+                          for cpu in domains}
+
+        # Special case for userspace, frequency is not seen as a tunable
+        userspace_freqs = {}
+        for cpu, (prev_gov, _) in prev_governors.items():
+            if prev_gov == "userspace":
+                userspace_freqs[cpu] = self.get_frequency(cpu)
+
+        for cpu in domains:
+            self.set_governor(cpu, governor, **kwargs)
+
+        try:
+            yield
+
+        finally:
+            for cpu, (prev_gov, tunables) in prev_governors.items():
+                self.set_governor(cpu, prev_gov, **tunables)
+                if prev_gov == "userspace":
+                    self.set_frequency(cpu, userspace_freqs[cpu])
 
     def list_governor_tunables(self, cpu):
         """Returns a list of tunables available for the governor on the specified CPU."""
@@ -105,11 +147,11 @@ class CpufreqModule(Module):
             try:
                 tunables_path = '/sys/devices/system/cpu/{}/cpufreq/{}'.format(cpu, governor)
                 self._governor_tunables[governor] = self.target.list_directory(tunables_path)
-            except (TargetError,subprocess.CalledProcessError):  # probably an older kernel
+            except TargetStableError:  # probably an older kernel
                 try:
                     tunables_path = '/sys/devices/system/cpu/cpufreq/{}'.format(governor)
                     self._governor_tunables[governor] = self.target.list_directory(tunables_path)
-                except (TargetError,subprocess.CalledProcessError):  # governor does not support tunables
+                except TargetStableError:  # governor does not support tunables
                     self._governor_tunables[governor] = []
         return self._governor_tunables[governor]
 
@@ -123,7 +165,7 @@ class CpufreqModule(Module):
                 try:
                     path = '/sys/devices/system/cpu/{}/cpufreq/{}/{}'.format(cpu, governor, tunable)
                     tunables[tunable] = self.target.read_value(path)
-                except (TargetError,subprocess.CalledProcessError):  # May be an older kernel
+                except TargetStableError:  # May be an older kernel
                     path = '/sys/devices/system/cpu/cpufreq/{}/{}'.format(governor, tunable)
                     tunables[tunable] = self.target.read_value(path)
         return tunables
@@ -141,7 +183,7 @@ class CpufreqModule(Module):
         The rest should be keyword parameters mapping tunable name onto the value to
         be set for it.
 
-        :raises: TargetError if governor specified is not a valid governor name, or if
+        :raises: TargetStableError if governor specified is not a valid governor name, or if
                  a tunable specified is not valid for the governor, or if could not set
                  tunable.
 
@@ -151,12 +193,12 @@ class CpufreqModule(Module):
         if governor is None:
             governor = self.get_governor(cpu)
         valid_tunables = self.list_governor_tunables(cpu)
-        for tunable, value in kwargs.iteritems():
+        for tunable, value in kwargs.items():
             if tunable in valid_tunables:
                 path = '/sys/devices/system/cpu/{}/cpufreq/{}/{}'.format(cpu, governor, tunable)
                 try:
                     self.target.write_value(path, value)
-                except (TargetError,subprocess.CalledProcessError):
+                except TargetStableError:
                     if self.target.file_exists(path):
                         # File exists but we did something wrong
                         raise
@@ -166,7 +208,7 @@ class CpufreqModule(Module):
             else:
                 message = 'Unexpected tunable {} for governor {} on {}.\n'.format(tunable, governor, cpu)
                 message += 'Available tunables are: {}'.format(valid_tunables)
-                raise TargetError(message)
+                raise TargetStableError(message)
 
     @memoized
     def list_frequencies(self, cpu):
@@ -177,15 +219,40 @@ class CpufreqModule(Module):
         try:
             cmd = 'cat /sys/devices/system/cpu/{}/cpufreq/scaling_available_frequencies'.format(cpu)
             output = self.target.execute(cmd)
-            available_frequencies = map(int, output.strip().split())  # pylint: disable=E1103
-        except (TargetError,subprocess.CalledProcessError):
+            available_frequencies = list(map(int, output.strip().split()))  # pylint: disable=E1103
+        except TargetStableError:
             # On some devices scaling_frequencies  is not generated.
             # http://adrynalyne-teachtofish.blogspot.co.uk/2011/11/how-to-enable-scalingavailablefrequenci.html
             # Fall back to parsing stats/time_in_state
-            cmd = 'cat /sys/devices/system/cpu/{}/cpufreq/stats/time_in_state'.format(cpu)
-            out_iter = iter(self.target.execute(cmd).strip().split())
-            available_frequencies = map(int, reversed([f for f, _ in zip(out_iter, out_iter)]))
+            path = '/sys/devices/system/cpu/{}/cpufreq/stats/time_in_state'.format(cpu)
+            try:
+                out_iter = iter(self.target.read_value(path).split())
+            except TargetStableError:
+                if not self.target.file_exists(path):
+                    # Probably intel_pstate. Can't get available freqs.
+                    return []
+                raise
+
+            available_frequencies = list(map(int, reversed([f for f, _ in zip(out_iter, out_iter)])))
         return available_frequencies
+
+    @memoized
+    def get_max_available_frequency(self, cpu):
+        """
+        Returns the maximum available frequency for a given core or None if
+        could not be found.
+        """
+        freqs = self.list_frequencies(cpu)
+        return max(freqs) if freqs else None
+
+    @memoized
+    def get_min_available_frequency(self, cpu):
+        """
+        Returns the minimum available frequency for a given core or None if
+        could not be found.
+        """
+        freqs = self.list_frequencies(cpu)
+        return min(freqs) if freqs else None
 
     def get_min_frequency(self, cpu):
         """
@@ -195,7 +262,7 @@ class CpufreqModule(Module):
         try to read the minimum frequency and the following exception will be
         raised ::
 
-        :raises: TargetError if for some reason the frequency could not be read.
+        :raises: TargetStableError if for some reason the frequency could not be read.
 
         """
         if isinstance(cpu, int):
@@ -215,7 +282,7 @@ class CpufreqModule(Module):
 
         on the device.
 
-        :raises: TargetError if the frequency is not supported by the CPU, or if, for
+        :raises: TargetStableError if the frequency is not supported by the CPU, or if, for
                  some reason, frequency could not be set.
         :raises: ValueError if ``frequency`` is not an integer.
 
@@ -226,7 +293,7 @@ class CpufreqModule(Module):
         try:
             value = int(frequency)
             if exact and available_frequencies and value not in available_frequencies:
-                raise TargetError('Can\'t set {} frequency to {}\nmust be in {}'.format(cpu,
+                raise TargetStableError('Can\'t set {} frequency to {}\nmust be in {}'.format(cpu,
                                                                                         value,
                                                                                         available_frequencies))
             sysfile = '/sys/devices/system/cpu/{}/cpufreq/scaling_min_freq'.format(cpu)
@@ -242,7 +309,7 @@ class CpufreqModule(Module):
         try to read the current frequency and the following exception will be
         raised ::
 
-        :raises: TargetError if for some reason the frequency could not be read.
+        :raises: TargetStableError if for some reason the frequency could not be read.
 
         """
         if isinstance(cpu, int):
@@ -264,7 +331,7 @@ class CpufreqModule(Module):
 
         on the device (if it exists).
 
-        :raises: TargetError if the frequency is not supported by the CPU, or if, for
+        :raises: TargetStableError if the frequency is not supported by the CPU, or if, for
                  some reason, frequency could not be set.
         :raises: ValueError if ``frequency`` is not an integer.
 
@@ -276,11 +343,11 @@ class CpufreqModule(Module):
             if exact:
                 available_frequencies = self.list_frequencies(cpu)
                 if available_frequencies and value not in available_frequencies:
-                    raise TargetError('Can\'t set {} frequency to {}\nmust be in {}'.format(cpu,
+                    raise TargetStableError('Can\'t set {} frequency to {}\nmust be in {}'.format(cpu,
                                                                                             value,
                                                                                             available_frequencies))
             if self.get_governor(cpu) != 'userspace':
-                raise TargetError('Can\'t set {} frequency; governor must be "userspace"'.format(cpu))
+                raise TargetStableError('Can\'t set {} frequency; governor must be "userspace"'.format(cpu))
             sysfile = '/sys/devices/system/cpu/{}/cpufreq/scaling_setspeed'.format(cpu)
             self.target.write_value(sysfile, value, verify=False)
         except ValueError:
@@ -294,7 +361,7 @@ class CpufreqModule(Module):
         try to read the maximum frequency and the following exception will be
         raised ::
 
-        :raises: TargetError if for some reason the frequency could not be read.
+        :raises: TargetStableError if for some reason the frequency could not be read.
         """
         if isinstance(cpu, int):
             cpu = 'cpu{}'.format(cpu)
@@ -313,7 +380,7 @@ class CpufreqModule(Module):
 
         on the device.
 
-        :raises: TargetError if the frequency is not supported by the CPU, or if, for
+        :raises: TargetStableError if the frequency is not supported by the CPU, or if, for
                  some reason, frequency could not be set.
         :raises: ValueError if ``frequency`` is not an integer.
 
@@ -324,7 +391,7 @@ class CpufreqModule(Module):
         try:
             value = int(frequency)
             if exact and available_frequencies and value not in available_frequencies:
-                raise TargetError('Can\'t set {} frequency to {}\nmust be in {}'.format(cpu,
+                raise TargetStableError('Can\'t set {} frequency to {}\nmust be in {}'.format(cpu,
                                                                                         value,
                                                                                         available_frequencies))
             sysfile = '/sys/devices/system/cpu/{}/cpufreq/scaling_max_freq'.format(cpu)
@@ -356,6 +423,7 @@ class CpufreqModule(Module):
         """
         Set the specified (minimum) frequency for all the (online) CPUs
         """
+        # pylint: disable=protected-access
         return self.target._execute_util(
                 'cpufreq_set_all_frequencies {}'.format(freq),
                 as_root=True)
@@ -364,6 +432,7 @@ class CpufreqModule(Module):
         """
         Get the current frequency for all the (online) CPUs
         """
+        # pylint: disable=protected-access
         output = self.target._execute_util(
                 'cpufreq_get_all_frequencies', as_root=True)
         frequencies = {}
@@ -379,16 +448,17 @@ class CpufreqModule(Module):
         Set the specified governor for all the (online) CPUs
         """
         try:
+            # pylint: disable=protected-access
             return self.target._execute_util(
                 'cpufreq_set_all_governors {}'.format(governor),
                 as_root=True)
-        except TargetError as e:
+        except TargetStableError as e:
             if ("echo: I/O error" in str(e) or
                 "write error: Invalid argument" in str(e)):
 
                 cpus_unsupported = [c for c in self.target.list_online_cpus()
                                     if governor not in self.list_governors(c)]
-                raise TargetError("Governor {} unsupported for CPUs {}".format(
+                raise TargetStableError("Governor {} unsupported for CPUs {}".format(
                     governor, cpus_unsupported))
             else:
                 raise
@@ -397,6 +467,7 @@ class CpufreqModule(Module):
         """
         Get the current governor for all the (online) CPUs
         """
+        # pylint: disable=protected-access
         output = self.target._execute_util(
                 'cpufreq_get_all_governors', as_root=True)
         governors = {}
@@ -411,10 +482,22 @@ class CpufreqModule(Module):
         """
         Report current frequencies on trace file
         """
+        # pylint: disable=protected-access
         return self.target._execute_util('cpufreq_trace_all_frequencies', as_root=True)
 
+    def get_affected_cpus(self, cpu):
+        """
+        Get the online CPUs that share a frequency domain with the given CPU
+        """
+        if isinstance(cpu, int):
+            cpu = 'cpu{}'.format(cpu)
+
+        sysfile = '/sys/devices/system/cpu/{}/cpufreq/affected_cpus'.format(cpu)
+
+        return [int(c) for c in self.target.read_value(sysfile).split()]
+
     @memoized
-    def get_domain_cpus(self, cpu):
+    def get_related_cpus(self, cpu):
         """
         Get the CPUs that share a frequency domain with the given CPU
         """
@@ -425,13 +508,25 @@ class CpufreqModule(Module):
 
         return [int(c) for c in self.target.read_value(sysfile).split()]
 
+    @memoized
+    def get_driver(self, cpu):
+        """
+        Get the name of the driver used by this cpufreq policy.
+        """
+        if isinstance(cpu, int):
+            cpu = 'cpu{}'.format(cpu)
+
+        sysfile = '/sys/devices/system/cpu/{}/cpufreq/scaling_driver'.format(cpu)
+
+        return self.target.read_value(sysfile).strip()
+
     def iter_domains(self):
         """
         Iterate over the frequency domains in the system
         """
         cpus = set(range(self.target.number_of_cpus))
         while cpus:
-            cpu = iter(cpus).next()
-            domain = self.target.cpufreq.get_domain_cpus(cpu)
+            cpu = next(iter(cpus))  # pylint: disable=stop-iteration-return
+            domain = self.target.cpufreq.get_related_cpus(cpu)
             yield domain
             cpus = cpus.difference(domain)

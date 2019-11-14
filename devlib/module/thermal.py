@@ -1,4 +1,4 @@
-#    Copyright 2015 ARM Limited
+#    Copyright 2015-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,7 +48,7 @@ class ThermalZone(object):
         self.path = target.path.join(root, self.name)
         self.trip_points = {}
 
-        for entry in self.target.list_directory(self.path):
+        for entry in self.target.list_directory(self.path, as_root=target.is_rooted):
             re_match = re.match('^trip_point_([0-9]+)_temp', entry)
             if re_match is not None:
                 self.add_trip_point(re_match.group(1))
@@ -61,8 +61,8 @@ class ThermalZone(object):
         value = self.target.read_value(self.target.path.join(self.path, 'mode'))
         return value == 'enabled'
 
-    def set_mode(self, enable):
-        value = 'enabled' if enable else 'disabled'
+    def set_enabled(self, enabled=True):
+        value = 'enabled' if enabled else 'disabled'
         self.target.write_value(self.target.path.join(self.path, 'mode'), value)
 
     def get_temperature(self):
@@ -88,6 +88,9 @@ class ThermalModule(Module):
 
         for entry in target.list_directory(self.thermal_root):
             re_match = re.match('^(thermal_zone|cooling_device)([0-9]+)', entry)
+            if not re_match:
+                self.logger.warning('unknown thermal entry: %s', entry)
+                continue
 
             if re_match.group(1) == 'thermal_zone':
                 self.add_thermal_zone(re_match.group(2))
@@ -100,5 +103,5 @@ class ThermalModule(Module):
 
     def disable_all_zones(self):
         """Disables all the thermal zones in the target"""
-        for zone in self.zones:
-            zone.set_mode('disabled')
+        for zone in self.zones.values():
+            zone.set_enabled(False)

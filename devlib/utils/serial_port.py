@@ -1,4 +1,4 @@
-#    Copyright 2013-2015 ARM Limited
+#    Copyright 2013-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ from logging import Logger
 
 import serial
 
+# pylint: disable=import-error,wrong-import-position,ungrouped-imports,wrong-import-order
 import pexpect
 from distutils.version import StrictVersion as V
 if V(pexpect.__version__) < V('4.0.0'):
@@ -32,6 +33,14 @@ from pexpect import EOF, TIMEOUT  # NOQA pylint: disable=W0611
 from devlib.exception import HostError
 
 
+class SerialLogger(Logger):
+
+    write = Logger.debug
+
+    def flush(self):
+        pass
+
+
 def pulse_dtr(conn, state=True, duration=0.1):
     """Set the DTR line of the specified serial connection to the specified state
     for the specified duration (note: the initial state of the line is *not* checked."""
@@ -40,19 +49,20 @@ def pulse_dtr(conn, state=True, duration=0.1):
     conn.setDTR(not state)
 
 
-def get_connection(timeout, init_dtr=None, logcls=Logger,
-                   *args, **kwargs):
+# pylint: disable=keyword-arg-before-vararg
+def get_connection(timeout, init_dtr=None, logcls=SerialLogger,
+                   logfile=None, *args, **kwargs):
     if init_dtr is not None:
         kwargs['dsrdtr'] = True
     try:
         conn = serial.Serial(*args, **kwargs)
     except serial.SerialException as e:
-        raise HostError(e.message)
+        raise HostError(str(e))
     if init_dtr is not None:
         conn.setDTR(init_dtr)
     conn.nonblocking()
     conn.flushOutput()
-    target = fdpexpect.fdspawn(conn.fileno(), timeout=timeout)
+    target = fdpexpect.fdspawn(conn.fileno(), timeout=timeout, logfile=logfile)
     target.logfile_read = logcls('read')
     target.logfile_send = logcls('send')
 
@@ -81,9 +91,10 @@ def write_characters(conn, line, delay=0.05):
     conn.sendline('')
 
 
+# pylint: disable=keyword-arg-before-vararg
 @contextmanager
 def open_serial_connection(timeout, get_conn=False, init_dtr=None,
-                           logcls=Logger, *args, **kwargs):
+                           logcls=SerialLogger, *args, **kwargs):
     """
     Opens a serial connection to a device.
 
@@ -103,11 +114,13 @@ def open_serial_connection(timeout, get_conn=False, init_dtr=None,
     """
     target, conn = get_connection(timeout, init_dtr=init_dtr,
                                   logcls=logcls, *args, **kwargs)
+
     if get_conn:
-        yield target, conn
+        target_and_conn = (target, conn)
     else:
-        yield target
+        target_and_conn = target
 
-    target.close()  # Closes the file descriptor used by the conn.
-    del conn
-
+    try:
+        yield target_and_conn
+    finally:
+        target.close()  # Closes the file descriptor used by the conn.

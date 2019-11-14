@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 
+import imp
 import os
 import sys
 import warnings
@@ -20,8 +21,10 @@ from itertools import chain
 
 try:
     from setuptools import setup
+    from setuptools.command.sdist import sdist as orig_sdist
 except ImportError:
     from distutils.core import setup
+    from distutils.command.sdist import sdist as orig_sdist
 
 
 devlib_dir = os.path.join(os.path.dirname(__file__), 'devlib')
@@ -36,6 +39,16 @@ try:
     os.remove('MANIFEST')
 except OSError:
     pass
+
+
+vh_path = os.path.join(devlib_dir, 'utils', 'version.py')
+# can load this, as it does not have any devlib imports
+version_helper = imp.load_source('version_helper', vh_path)
+__version__ = version_helper.get_devlib_version()
+commit = version_helper.get_commit()
+if commit:
+    __version__ = '{}+{}'.format(__version__, commit)
+
 
 packages = []
 data_files = {}
@@ -59,10 +72,10 @@ for root, dirs, files in os.walk(devlib_dir):
 params = dict(
     name='devlib',
     description='A framework for automating workload execution and measurment collection on ARM devices.',
-    version='0.0.4',
+    version=__version__,
     packages=packages,
     package_data=data_files,
-    url='N/A',
+    url='https://github.com/ARM-software/devlib',
     license='Apache v2',
     maintainer='ARM Ltd.',
     install_requires=[
@@ -70,22 +83,51 @@ params = dict(
         'pexpect>=3.3',  # Send/recieve to/from device
         'pyserial',  # Serial port interface
         'wrapt',  # Basic for construction of decorator functions
+        'future', # Python 2-3 compatibility
+        'enum34;python_version<"3.4"', # Enums for Python < 3.4
+        'contextlib2;python_version<"3.0"', # Python 3 contextlib backport for Python 2
+        'numpy<=1.16.4; python_version<"3"',
+        'numpy; python_version>="3"',
+        'pandas<=0.24.2; python_version<"3"',
+        'pandas; python_version>"3"',
     ],
     extras_require={
         'daq': ['daqpower'],
         'doc': ['sphinx'],
         'monsoon': ['python-gflags'],
+        'acme': ['pandas', 'numpy'],
     },
     # https://pypi.python.org/pypi?%3Aaction=list_classifiers
     classifiers=[
-        'Development Status :: 4 - Beta',
+        'Development Status :: 5 - Production/Stable',
         'License :: OSI Approved :: Apache Software License',
         'Operating System :: POSIX :: Linux',
-        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3',
     ],
 )
 
-all_extras = list(chain(params['extras_require'].itervalues()))
+all_extras = list(chain(iter(params['extras_require'].values())))
 params['extras_require']['full'] = all_extras
+
+
+class sdist(orig_sdist):
+
+    user_options = orig_sdist.user_options + [
+        ('strip-commit', 's',
+         "Strip git commit hash from package version ")
+    ]
+
+    def initialize_options(self):
+        orig_sdist.initialize_options(self)
+        self.strip_commit = False
+
+
+    def run(self):
+        if self.strip_commit:
+            self.distribution.get_version = lambda : __version__.split('+')[0]
+        orig_sdist.run(self)
+
+
+params['cmdclass'] = {'sdist': sdist}
 
 setup(**params)

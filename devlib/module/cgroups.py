@@ -1,4 +1,4 @@
-#    Copyright 2014-2015 ARM Limited
+#    Copyright 2014-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +14,11 @@
 #
 # pylint: disable=attribute-defined-outside-init
 import logging
+import re
 from collections import namedtuple
 
 from devlib.module import Module
-from devlib.exception import TargetError
+from devlib.exception import TargetStableError
 from devlib.utils.misc import list_to_ranges, isiterable
 from devlib.utils.types import boolean
 
@@ -102,7 +103,7 @@ class Controller(object):
                     .format(self.kind))
         if name not in self._cgroups:
             self._cgroups[name] = CGroup(self, name, create=False)
-        return self._cgroups[name].existe()
+        return self._cgroups[name].exists()
 
     def list_all(self):
         self.logger.debug('Listing groups for %s controller', self.kind)
@@ -120,18 +121,19 @@ class Controller(object):
             cgroups.append(cg)
         return cgroups
 
-    def move_tasks(self, source, dest, exclude=[]):
-        try:
-            srcg = self._cgroups[source]
-            dstg = self._cgroups[dest]
-        except KeyError as e:
-            raise ValueError('Unkown group: {}'.format(e))
-        output = self.target._execute_util(
+    def move_tasks(self, source, dest, exclude=None):
+        if exclude is None:
+            exclude = []
+
+        srcg = self.cgroup(source)
+        dstg = self.cgroup(dest)
+
+        self.target._execute_util(  # pylint: disable=protected-access
                     'cgroups_tasks_move {} {} \'{}\''.format(
                     srcg.directory, dstg.directory, exclude),
                     as_root=True)
 
-    def move_all_tasks_to(self, dest, exclude=[]):
+    def move_all_tasks_to(self, dest, exclude=None):
         """
         Move all the tasks to the specified CGroup
 
@@ -144,8 +146,10 @@ class Controller(object):
         tasks.
 
         :param exclude: list of commands to keep in the root CGroup
-        :type exlude: list(str)
+        :type exclude: list(str)
         """
+        if exclude is None:
+            exclude = []
 
         if isinstance(exclude, str):
             exclude = [exclude]
@@ -153,48 +157,88 @@ class Controller(object):
             raise ValueError('wrong type for "exclude" parameter, '
                              'it must be a str or a list')
 
-        logging.debug('Moving all tasks into %s', dest)
+        self.logger.debug('Moving all tasks into %s', dest)
 
         # Build list of tasks to exclude
         grep_filters = ''
         for comm in exclude:
             grep_filters += '-e {} '.format(comm)
-        logging.debug('   using grep filter: %s', grep_filters)
+        self.logger.debug('   using grep filter: %s', grep_filters)
         if grep_filters != '':
-            logging.debug('   excluding tasks which name matches:')
-            logging.debug('   %s', ', '.join(exclude))
+            self.logger.debug('   excluding tasks which name matches:')
+            self.logger.debug('   %s', ', '.join(exclude))
 
-        for cgroup in self._cgroups:
+        for cgroup in self.list_all():
             if cgroup != dest:
                 self.move_tasks(cgroup, dest, grep_filters)
 
-    def tasks(self, cgroup):
+    # pylint: disable=too-many-locals
+    def tasks(self, cgroup,
+              filter_tid='',
+              filter_tname='',
+              filter_tcmdline=''):
+        """
+        Report the tasks that are included in a cgroup. The tasks can be
+        filtered by their tid, tname or tcmdline if filter_tid, filter_tname or
+        filter_tcmdline are defined respectively. In this case, the reported
+        tasks are the ones in the cgroup that match these patterns.
+
+        Example of tasks format:
+        TID,tname,tcmdline
+        903,cameraserver,/system/bin/cameraserver
+
+        :params filter_tid: regexp pattern to filter by TID
+        :type filter_tid: str
+
+        :params filter_tname: regexp pattern to filter by tname
+        :type filter_tname: str
+
+        :params filter_tcmdline: regexp pattern to filter by tcmdline
+        :type filter_tcmdline: str
+
+        :returns: a dictionary in the form: {tid:(tname, tcmdline)}
+        """
+        if not isinstance(filter_tid, str):
+            raise TypeError('filter_tid should be a str')
+        if not isinstance(filter_tname, str):
+            raise TypeError('filter_tname should be a str')
+        if not isinstance(filter_tcmdline, str):
+            raise TypeError('filter_tcmdline should be a str')
         try:
             cg = self._cgroups[cgroup]
         except KeyError as e:
-            raise ValueError('Unkown group: {}'.format(e))
-        output = self.target._execute_util(
+            raise ValueError('Unknown group: {}'.format(e))
+        output = self.target._execute_util(  # pylint: disable=protected-access
                     'cgroups_tasks_in {}'.format(cg.directory),
                     as_root=True)
         entries = output.splitlines()
         tasks = {}
         for task in entries:
-            tid = task.split(',')[0]
-            try:
-                tname = task.split(',')[1]
-            except: continue
-            try:
-                tcmdline = task.split(',')[2]
-            except:
+            fields = task.split(',', 2)
+            nr_fields = len(fields)
+            if nr_fields < 2:
+                continue
+            elif nr_fields == 2:
+                tid_str, tname = fields
                 tcmdline = ''
-            tasks[int(tid)] = (tname, tcmdline)
+            else:
+                tid_str, tname, tcmdline = fields
+
+            if not re.search(filter_tid, tid_str):
+                continue
+            if not re.search(filter_tname, tname):
+                continue
+            if not re.search(filter_tcmdline, tcmdline):
+                continue
+
+            tasks[int(tid_str)] = (tname, tcmdline)
         return tasks
 
     def tasks_count(self, cgroup):
         try:
             cg = self._cgroups[cgroup]
         except KeyError as e:
-            raise ValueError('Unkown group: {}'.format(e))
+            raise ValueError('Unknown group: {}'.format(e))
         output = self.target.execute(
                     '{} wc -l {}/tasks'.format(
                     self.target.busybox, cg.directory),
@@ -217,8 +261,9 @@ class CGroup(object):
 
         # Control cgroup path
         self.directory = controller.mount_point
+
         if name != '/':
-            self.directory = self.target.path.join(controller.mount_point, name[1:])
+            self.directory = self.target.path.join(controller.mount_point, name.strip('/'))
 
         # Setup path for tasks file
         self.tasks_file = self.target.path.join(self.directory, 'tasks')
@@ -236,17 +281,15 @@ class CGroup(object):
             self.target.execute('[ -d {0} ]'\
                 .format(self.directory), as_root=True)
             return True
-        except TargetError:
+        except TargetStableError:
             return False
 
     def get(self):
         conf = {}
 
-        logging.debug('Reading %s attributes from:',
-                self.controller.kind)
-        logging.debug('  %s',
-                self.directory)
-        output = self.target._execute_util(
+        self.logger.debug('Reading %s attributes from:', self.controller.kind)
+        self.logger.debug('  %s', self.directory)
+        output = self.target._execute_util(  # pylint: disable=protected-access
                     'cgroups_get_attributes {} {}'.format(
                     self.directory, self.controller.kind),
                     as_root=True)
@@ -262,7 +305,7 @@ class CGroup(object):
             if isiterable(attrs[idx]):
                 attrs[idx] = list_to_ranges(attrs[idx])
             # Build attribute path
-            if self.controller._noprefix:
+            if self.controller._noprefix:  # pylint: disable=protected-access
                 attr_name = '{}'.format(idx)
             else:
                 attr_name = '{}.{}'.format(self.controller.kind, idx)
@@ -274,7 +317,7 @@ class CGroup(object):
             # Set the attribute value
             try:
                 self.target.write_value(path, attrs[idx])
-            except TargetError:
+            except TargetStableError:
                 # Check if the error is due to a non-existing attribute
                 attrs = self.get()
                 if idx not in attrs:
@@ -284,8 +327,8 @@ class CGroup(object):
 
     def get_tasks(self):
         task_ids = self.target.read_value(self.tasks_file).split()
-        logging.debug('Tasks: %s', task_ids)
-        return map(int, task_ids)
+        self.logger.debug('Tasks: %s', task_ids)
+        return list(map(int, task_ids))
 
     def add_task(self, tid):
         self.target.write_value(self.tasks_file, tid, verify=False)
@@ -323,7 +366,7 @@ class CgroupsModule(Module):
 
         # Get the list of the available controllers
         subsys = self.list_subsystems()
-        if len(subsys) == 0:
+        if not subsys:
             self.logger.warning('No CGroups controller available')
             return
 
@@ -344,9 +387,9 @@ class CgroupsModule(Module):
             controller = Controller(ss.name, hid, hierarchy[hid])
             try:
                 controller.mount(self.target, self.cgroup_root)
-            except TargetError:
+            except TargetStableError:
                 message = 'Failed to mount "{}" controller'
-                raise TargetError(message.format(controller.kind))
+                raise TargetStableError(message.format(controller.kind))
             self.logger.info('  %-12s : %s', controller.kind,
                              controller.mount_point)
             self.controllers[ss.name] = controller
@@ -354,7 +397,7 @@ class CgroupsModule(Module):
     def list_subsystems(self):
         subsystems = []
         for line in self.target.execute('{} cat /proc/cgroups'\
-                .format(self.target.busybox)).splitlines()[1:]:
+                .format(self.target.busybox), as_root=self.target.is_rooted).splitlines()[1:]:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
@@ -380,20 +423,27 @@ class CgroupsModule(Module):
         :param cgroup: Name of cgroup to run command into
         :returns: A command to run `cmdline` into `cgroup`
         """
+        if not cgroup.startswith('/'):
+            message = 'cgroup name "{}" must start with "/"'.format(cgroup)
+            raise ValueError(message)
         return 'CGMOUNT={} {} cgroups_run_into {} {}'\
                 .format(self.cgroup_root, self.target.shutils,
                         cgroup, cmdline)
 
-    def run_into(self, cgroup, cmdline):
+    def run_into(self, cgroup, cmdline, as_root=None):
         """
         Run the specified command into the specified CGroup
 
         :param cmdline: Command to be run into cgroup
         :param cgroup: Name of cgroup to run command into
+        :param as_root: Specify whether to run the command as root, if not
+                        specified will default to whether the target is rooted.
         :returns: Output of command.
         """
+        if as_root is None:
+            as_root = self.target.is_rooted
         cmd = self.run_into_cmd(cgroup, cmdline)
-        raw_output = self.target.execute(cmd)
+        raw_output = self.target.execute(cmd, as_root=as_root)
 
         # First line of output comes from shutils; strip it out.
         return raw_output.split('\n', 1)[1]
@@ -404,11 +454,11 @@ class CgroupsModule(Module):
         A regexps of tasks names can be used to defined tasks which should not
         be moved.
         """
-        return self.target._execute_util(
+        return self.target._execute_util(  # pylint: disable=protected-access
             'cgroups_tasks_move {} {} {}'.format(srcg, dstg, exclude),
             as_root=True)
 
-    def isolate(self, cpus, exclude=[]):
+    def isolate(self, cpus, exclude=None):
         """
         Remove all userspace tasks from specified CPUs.
 
@@ -425,6 +475,8 @@ class CgroupsModule(Module):
                  sandbox is the CGroup of sandboxed CPUs
                  isolated is the CGroup of isolated CPUs
         """
+        if exclude is None:
+            exclude = []
         all_cpus = set(range(self.target.number_of_cpus))
         sbox_cpus = list(all_cpus - set(cpus))
         isol_cpus = list(all_cpus - set(sbox_cpus))
@@ -443,7 +495,7 @@ class CgroupsModule(Module):
 
         return sbox_cg, isol_cg
 
-    def freeze(self, exclude=[], thaw=False):
+    def freeze(self, exclude=None, thaw=False):
         """
         Freeze all user-space tasks but the specified ones
 
@@ -461,16 +513,20 @@ class CgroupsModule(Module):
         :type thaw: bool
         """
 
+        if exclude is None:
+            exclude = []
+
         # Create Freezer CGroup
         freezer = self.controller('freezer')
         if freezer is None:
             raise RuntimeError('freezer cgroup controller not present')
         freezer_cg = freezer.cgroup('/DEVLIB_FREEZER')
-        thawed_cg = freezer.cgroup('/')
+        cmd = 'cgroups_freezer_set_state {{}} {}'.format(freezer_cg.directory)
 
         if thaw:
-            # Restart froozen tasks
-            freezer_cg.set(state='THAWED')
+            # Restart frozen tasks
+            # pylint: disable=protected-access
+            freezer.target._execute_util(cmd.format('THAWED'), as_root=True)
             # Remove all tasks from freezer
             freezer.move_all_tasks_to('/')
             return
@@ -482,7 +538,7 @@ class CgroupsModule(Module):
         tasks = freezer.tasks('/')
 
         # Freeze all tasks
-        freezer_cg.set(state='FROZEN')
+        # pylint: disable=protected-access
+        freezer.target._execute_util(cmd.format('FROZEN'), as_root=True)
 
         return tasks
-

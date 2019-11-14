@@ -1,4 +1,4 @@
-#    Copyright 2015 ARM Limited
+#    Copyright 2015-2017 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ from __future__ import division
 import re
 
 from devlib.instrument import Instrument, Measurement, INSTANTANEOUS
-from devlib.exception import TargetError
+from devlib.exception import TargetStableError
 
 
 class HwmonInstrument(Instrument):
@@ -35,7 +35,7 @@ class HwmonInstrument(Instrument):
 
     def __init__(self, target):
         if not hasattr(target, 'hwmon'):
-            raise TargetError('Target does not support HWMON')
+            raise TargetStableError('Target does not support HWMON')
         super(HwmonInstrument, self).__init__(target)
 
         self.logger.debug('Discovering available HWMON sensors...')
@@ -45,7 +45,7 @@ class HwmonInstrument(Instrument):
                 measure = self.measure_map.get(ts.kind)[0]
                 if measure:
                     self.logger.debug('\tAdding sensor {}'.format(ts.name))
-                    self.add_channel(_guess_site(ts), measure, name=ts.name, sensor=ts)
+                    self.add_channel(_guess_site(ts), measure, sensor=ts)
                 else:
                     self.logger.debug('\tSkipping sensor {} (unknown kind "{}")'.format(ts.name, ts.kind))
             except ValueError:

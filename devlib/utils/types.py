@@ -1,4 +1,4 @@
-#    Copyright 2014-2015 ARM Limited
+#    Copyright 2014-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,11 @@ is not the best language to use for configuration.
 
 """
 import math
+import re
+import sys
+from functools import total_ordering
+
+from past.builtins import basestring
 
 from devlib.utils.misc import isiterable, to_identifier, ranges_to_list, list_to_mask
 
@@ -68,6 +73,15 @@ def numeric(value):
     """
     if isinstance(value, int):
         return value
+
+    if isinstance(value, basestring):
+        value = value.strip()
+        if value.endswith('%'):
+            try:
+                return float(value.rstrip('%')) / 100
+            except ValueError:
+                raise ValueError('Not numeric: {}'.format(value))
+
     try:
         fvalue = float(value)
     except ValueError:
@@ -79,6 +93,7 @@ def numeric(value):
     return fvalue
 
 
+@total_ordering
 class caseless_string(str):
     """
     Just like built-in Python string except case-insensitive on comparisons. However, the
@@ -92,12 +107,17 @@ class caseless_string(str):
         return self.lower() == other
 
     def __ne__(self, other):
-        return not self.__eq__(other)
-
-    def __cmp__(self, other):
-        if isinstance(basestring, other):
+        if isinstance(other, basestring):
             other = other.lower()
-        return cmp(self.lower(), other)
+        return self.lower() != other
+
+    def __lt__(self, other):
+        if isinstance(other, basestring):
+            other = other.lower()
+        return self.lower() < other
+
+    def __hash__(self):
+        return hash(self.lower())
 
     def format(self, *args, **kwargs):
         return caseless_string(super(caseless_string, self).format(*args, **kwargs))
@@ -111,3 +131,40 @@ def bitmask(value):
     if not isinstance(value, int):
         raise ValueError(value)
     return value
+
+
+regex_type = type(re.compile(''))
+
+
+if sys.version_info[0] == 3:
+    def regex(value):
+        if isinstance(value, regex_type):
+            if isinstance(value.pattern, str):
+                return value
+            return re.compile(value.pattern.decode(),
+                              value.flags | re.UNICODE)
+        else:
+            if isinstance(value, bytes):
+                value = value.decode()
+            return re.compile(value)
+
+
+    def bytes_regex(value):
+        if isinstance(value, regex_type):
+            if isinstance(value.pattern, bytes):
+                return value
+            return re.compile(value.pattern.encode(sys.stdout.encoding or 'utf-8'),
+                              value.flags & ~re.UNICODE)
+        else:
+            if isinstance(value, str):
+                value = value.encode(sys.stdout.encoding or 'utf-8')
+            return re.compile(value)
+else:
+    def regex(value):
+        if isinstance(value, regex_type):
+            return value
+        else:
+            return re.compile(value)
+
+
+    bytes_regex = regex

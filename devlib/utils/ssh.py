@@ -1,4 +1,4 @@
-#    Copyright 2014-2015 ARM Limited
+#    Copyright 2014-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,8 +23,13 @@ import threading
 import tempfile
 import shutil
 import socket
+import sys
 import time
+import atexit
+from pipes import quote
+from future.utils import raise_from
 
+# pylint: disable=import-error,wrong-import-position,ungrouped-imports,wrong-import-order
 import pexpect
 from distutils.version import StrictVersion as V
 if V(pexpect.__version__) < V('4.0.0'):
@@ -33,8 +38,11 @@ else:
     from pexpect import pxssh
 from pexpect import EOF, TIMEOUT, spawn
 
-from devlib.exception import HostError, TargetError, TimeoutError
-from devlib.utils.misc import which, strip_bash_colors, escape_single_quotes, check_output
+# pylint: disable=redefined-builtin,wrong-import-position
+from devlib.exception import (HostError, TargetStableError, TargetNotRespondingError,
+                              TimeoutError, TargetTransientError)
+from devlib.utils.misc import (which, strip_bash_colors, check_output,
+                               sanitize_cmd_template, memoized)
 from devlib.utils.types import boolean
 
 
@@ -55,7 +63,7 @@ def ssh_get_shell(host, username, password=None, keyfile=None, port=None, timeou
                 raise ValueError('keyfile may not be used with a telnet connection.')
             conn = TelnetPxssh(original_prompt=original_prompt)
         else:  # ssh
-            conn = pxssh.pxssh(options=options)
+            conn = pxssh.pxssh(echo=False)
 
         try:
             if keyfile:
@@ -67,10 +75,10 @@ def ssh_get_shell(host, username, password=None, keyfile=None, port=None, timeou
             timeout -= time.time() - start_time
             if timeout <= 0:
                 message = 'Could not connect to {}; is the host name correct?'
-                raise TargetError(message.format(host))
+                raise TargetTransientError(message.format(host))
             time.sleep(5)
 
-    conn.setwinsize(500,200)
+    conn.setwinsize(500, 200)
     conn.sendline('')
     conn.prompt()
     conn.setecho(False)
@@ -144,12 +152,25 @@ class SshConnection(object):
 
     default_password_prompt = '[sudo] password'
     max_cancel_attempts = 5
-    default_timeout=10
+    default_timeout = 10
 
     @property
     def name(self):
         return self.host
 
+    @property
+    def connected_as_root(self):
+        if self._connected_as_root is None:
+            # Execute directly to prevent deadlocking of connection
+            result = self._execute_and_wait_for_prompt('id', as_root=False)
+            self._connected_as_root = 'uid=0(' in result
+        return self._connected_as_root
+
+    @connected_as_root.setter
+    def connected_as_root(self, state):
+        self._connected_as_root = state
+
+    # pylint: disable=unused-argument,super-init-not-called
     def __init__(self,
                  host,
                  username,
@@ -161,9 +182,9 @@ class SshConnection(object):
                  password_prompt=None,
                  original_prompt=None,
                  platform=None,
-                 sudo_cmd="sudo -- sh -c '{}'",
-                 options=None
+                 sudo_cmd="sudo -- sh -c {}"
                  ):
+        self._connected_as_root = None
         self.host = host
         self.username = username
         self.password = password
@@ -171,11 +192,11 @@ class SshConnection(object):
         self.port = port
         self.lock = threading.Lock()
         self.password_prompt = password_prompt if password_prompt is not None else self.default_password_prompt
-        self.sudo_cmd = sudo_cmd
+        self.sudo_cmd = sanitize_cmd_template(sudo_cmd)
         logger.debug('Logging in {}@{}'.format(username, host))
         timeout = timeout if timeout is not None else self.default_timeout
-        self.options = options if options is not None else {}
-        self.conn = ssh_get_shell(host, username, password, self.keyfile, port, timeout, False, None, options=self.options)
+        self.conn = ssh_get_shell(host, username, password, self.keyfile, port, timeout, False, None)
+        atexit.register(self.close)
 
     def push(self, source, dest, timeout=30):
         dest = '{}@{}:{}'.format(self.username, self.host, dest)
@@ -186,7 +207,7 @@ class SshConnection(object):
         return self._scp(source, dest, timeout)
 
     def execute(self, command, timeout=None, check_exit_code=True,
-                as_root=False, strip_colors=True): #pylint: disable=unused-argument
+                as_root=False, strip_colors=True, will_succeed=False): #pylint: disable=unused-argument
         if command == '':
             # Empty command is valid but the __devlib_ec stuff below will
             # produce a syntax error with bash. Treat as a special case.
@@ -194,74 +215,87 @@ class SshConnection(object):
         try:
             with self.lock:
                 _command = '({}); __devlib_ec=$?; echo; echo $__devlib_ec'.format(command)
-                raw_output = self._execute_and_wait_for_prompt(
-                    _command, timeout, as_root, strip_colors)
-                output, exit_code_text, _ = raw_output.rsplit('\r\n', 2)
+                full_output = self._execute_and_wait_for_prompt(_command, timeout, as_root, strip_colors)
+                split_output = full_output.rsplit('\r\n', 2)
+                try:
+                    output, exit_code_text, _ = split_output
+                except ValueError as e:
+                    raise TargetStableError(
+                        "cannot split reply (target misconfiguration?):\n'{}'".format(full_output))
                 if check_exit_code:
                     try:
                         exit_code = int(exit_code_text)
                         if exit_code:
-                            raise subprocess.CalledProcessError(exit_code, command, output)
+                            message = 'Got exit code {}\nfrom: {}\nOUTPUT: {}'
+                            raise TargetStableError(message.format(exit_code, command, output))
                     except (ValueError, IndexError):
                         logger.warning(
                             'Could not get exit code for "{}",\ngot: "{}"'\
                             .format(command, exit_code_text))
                 return output
         except EOF:
-            raise TargetError('Connection lost.')
+            raise TargetNotRespondingError('Connection lost.')
+        except TargetStableError as e:
+            if will_succeed:
+                raise TargetTransientError(e)
+            else:
+                raise
 
     def background(self, command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, as_root=False):
         try:
             port_string = '-p {}'.format(self.port) if self.port else ''
             keyfile_string = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
-            if as_root:
+            if as_root and not self.connected_as_root:
                 command = self.sudo_cmd.format(command)
             command = '{} {} {} {}@{} {}'.format(ssh, keyfile_string, port_string, self.username, self.host, command)
             logger.debug(command)
             if self.password:
-                command = _give_password(self.password, command)
+                command, _ = _give_password(self.password, command)
             return subprocess.Popen(command, stdout=stdout, stderr=stderr, shell=True)
         except EOF:
-            raise TargetError('Connection lost.')
+            raise TargetNotRespondingError('Connection lost.')
 
     def close(self):
         logger.debug('Logging out {}@{}'.format(self.username, self.host))
-        self.conn.logout()
+        try:
+            self.conn.logout()
+        except:
+            logger.debug('Connection lost.')
+            self.conn.close(force=True)
 
     def cancel_running_command(self):
         # simulate impatiently hitting ^C until command prompt appears
         logger.debug('Sending ^C')
-        for _ in xrange(self.max_cancel_attempts):
-            self.conn.sendline(chr(3))
+        for _ in range(self.max_cancel_attempts):
+            self._sendline(chr(3))
             if self.conn.prompt(0.1):
                 return True
         return False
 
     def _execute_and_wait_for_prompt(self, command, timeout=None, as_root=False, strip_colors=True, log=True):
         self.conn.prompt(0.1)  # clear an existing prompt if there is one.
-        if self.username == 'root':
+        if as_root and self.connected_as_root:
             # As we're already root, there is no need to use sudo.
             as_root = False
         if as_root:
-            command = self.sudo_cmd.format(escape_single_quotes(command))
+            command = self.sudo_cmd.format(quote(command))
             if log:
                 logger.debug(command)
-            self.conn.sendline(command)
+            self._sendline(command)
             if self.password:
                 index = self.conn.expect_exact([self.password_prompt, TIMEOUT], timeout=0.5)
                 if index == 0:
-                    self.conn.sendline(self.password)
+                    self._sendline(self.password)
         else:  # not as_root
             if log:
                 logger.debug(command)
-            self.conn.sendline(command)
+            self._sendline(command)
         timed_out = self._wait_for_prompt(timeout)
-        # the regex removes line breaks potential introduced when writing
-        # command to shell.
-        output = process_backspaces(self.conn.before)
-        output = re.sub(r'\r([^\n])', r'\1', output)
-        if '\r\n' in output: # strip the echoed command
-            output = output.split('\r\n', 1)[1]
+        if sys.version_info[0] == 3:
+            output = process_backspaces(self.conn.before.decode(sys.stdout.encoding or 'utf-8', 'replace'))
+        else:
+            output = process_backspaces(self.conn.before)
+
         if timed_out:
             self.cancel_running_command()
             raise TimeoutError(command, output)
@@ -282,24 +316,40 @@ class SshConnection(object):
         # fails to connect to a device if port is explicitly specified using -P
         # option, even if it is the default port, 22. To minimize this problem,
         # only specify -P for scp if the port is *not* the default.
-        port_string = '-P {}'.format(self.port) if (self.port and self.port != 22) else ''
-        keyfile_string = '-i {}'.format(self.keyfile) if self.keyfile else ''
-        options = " ".join([ "-o{}={}".format(key,val) for key,val in self.options.items()])
-        command = '{} {} -r {} {} {} {}'.format(scp, options, keyfile_string, port_string, source, dest)
-        pass_string = ''
+        port_string = '-P {}'.format(quote(str(self.port))) if (self.port and self.port != 22) else ''
+        keyfile_string = '-i {}'.format(quote(self.keyfile)) if self.keyfile else ''
+        command = '{} -r {} {} {} {}'.format(scp, keyfile_string, port_string, quote(source), quote(dest))
+        command_redacted = command
         logger.debug(command)
         if self.password:
-            command = _give_password(self.password, command)
+            command, command_redacted = _give_password(self.password, command)
         try:
             check_output(command, timeout=timeout, shell=True)
         except subprocess.CalledProcessError as e:
-            raise subprocess.CalledProcessError(e.returncode, e.cmd.replace(pass_string, ''), e.output)
+            raise_from(HostError("Failed to copy file with '{}'. Output:\n{}".format(
+                command_redacted, e.output)), None)
         except TimeoutError as e:
-            raise TimeoutError(e.command.replace(pass_string, ''), e.output)
+            raise TimeoutError(command_redacted, e.output)
 
+    def _sendline(self, command):
+        # Workaround for https://github.com/pexpect/pexpect/issues/552
+        if len(command) == self._get_window_size()[1] - self._get_prompt_length():
+            command += ' '
+        self.conn.sendline(command)
+
+    @memoized
+    def _get_prompt_length(self):
+        self.conn.sendline()
+        self.conn.prompt()
+        return len(self.conn.after)
+
+    @memoized
+    def _get_window_size(self):
+        return self.conn.getwinsize()
 
 class TelnetConnection(SshConnection):
 
+    # pylint: disable=super-init-not-called
     def __init__(self,
                  host,
                  username,
@@ -323,6 +373,7 @@ class TelnetConnection(SshConnection):
 
 class Gem5Connection(TelnetConnection):
 
+    # pylint: disable=super-init-not-called
     def __init__(self,
                  platform,
                  host=None,
@@ -332,14 +383,15 @@ class Gem5Connection(TelnetConnection):
                  timeout=None,
                  password_prompt=None,
                  original_prompt=None,
+                 strip_echoed_commands=False,
                  ):
         if host is not None:
             host_system = socket.gethostname()
             if host_system != host:
-                raise TargetError("Gem5Connection can only connect to gem5 "
-                                   "simulations on your current host, which "
-                                   "differs from the one given {}!"
-                                   .format(host_system, host))
+                raise TargetStableError("Gem5Connection can only connect to gem5 "
+                                  "simulations on your current host {}, which "
+                                  "differs from the one given {}!"
+                                  .format(host_system, host))
         if username is not None and username != 'root':
             raise ValueError('User should be root in gem5!')
         if password is not None and password != '':
@@ -348,6 +400,8 @@ class Gem5Connection(TelnetConnection):
         self.is_rooted = True
         self.password = None
         self.port = None
+        # Flag to indicate whether commands are echoed by the simulated system
+        self.strip_echoed_commands = strip_echoed_commands
         # Long timeouts to account for gem5 being slow
         # Can be overriden if the given timeout is longer
         self.default_timeout = 3600
@@ -422,13 +476,12 @@ class Gem5Connection(TelnetConnection):
         if os.path.basename(dest) != filename:
             dest = os.path.join(dest, filename)
         # Back to the gem5 world
-        self._gem5_shell("ls -al {}{}".format(self.gem5_input_dir, filename))
-        self._gem5_shell("cat '{}''{}' > '{}'".format(self.gem5_input_dir,
-                                                     filename,
-                                                     dest))
+        filename = quote(self.gem5_input_dir + filename)
+        self._gem5_shell("ls -al {}".format(filename))
+        self._gem5_shell("cat {} > {}".format(filename, quote(dest)))
         self._gem5_shell("sync")
-        self._gem5_shell("ls -al {}".format(dest))
-        self._gem5_shell("ls -al {}".format(self.gem5_input_dir))
+        self._gem5_shell("ls -al {}".format(quote(dest)))
+        self._gem5_shell("ls -al {}".format(quote(self.gem5_input_dir)))
         logger.debug("Push complete.")
 
     def pull(self, source, dest, timeout=0): #pylint: disable=unused-argument
@@ -444,7 +497,7 @@ class Gem5Connection(TelnetConnection):
         self._check_ready()
 
         result = self._gem5_shell("ls {}".format(source))
-        files = result.split()
+        files = strip_bash_colors(result).split()
 
         for filename in files:
             dest_file = os.path.basename(filename)
@@ -457,8 +510,8 @@ class Gem5Connection(TelnetConnection):
             if os.path.isabs(source):
                 if os.path.dirname(source) != self.execute('pwd',
                                               check_exit_code=False):
-                    self._gem5_shell("cat '{}' > '{}'".format(filename,
-                                                              dest_file))
+                    self._gem5_shell("cat {} > {}".format(quote(filename),
+                                                              quote(dest_file)))
             self._gem5_shell("sync")
             self._gem5_shell("ls -la {}".format(dest_file))
             logger.debug('Finished the copy in the simulator')
@@ -479,16 +532,23 @@ class Gem5Connection(TelnetConnection):
             logger.debug("Pull complete.")
 
     def execute(self, command, timeout=1000, check_exit_code=True,
-                as_root=False, strip_colors=True):
+                as_root=False, strip_colors=True, will_succeed=False):
         """
         Execute a command on the gem5 platform
         """
         # First check if the connection is set up to interact with gem5
         self._check_ready()
 
-        output = self._gem5_shell(command,
-                                  check_exit_code=check_exit_code,
-                                  as_root=as_root)
+        try:
+            output = self._gem5_shell(command,
+                                      check_exit_code=check_exit_code,
+                                      as_root=as_root)
+        except TargetStableError as e:
+            if will_succeed:
+                raise TargetTransientError(e)
+            else:
+                raise
+
         if strip_colors:
             output = strip_bash_colors(output)
         return output
@@ -504,8 +564,8 @@ class Gem5Connection(TelnetConnection):
         trial = 0
         while os.path.isfile(redirection_file):
             # Log file already exists so add to name
-           redirection_file = 'BACKGROUND_{}{}.log'.format(command_name, trial)
-           trial += 1
+            redirection_file = 'BACKGROUND_{}{}.log'.format(command_name, trial)
+            trial += 1
 
         # Create the command to pass on to gem5 shell
         complete_command = '{} >> {} 2>&1 &'.format(command, redirection_file)
@@ -523,6 +583,10 @@ class Gem5Connection(TelnetConnection):
         """
         gem5_logger.info("Gracefully terminating the gem5 simulation.")
         try:
+            # Unmount the virtio device BEFORE we kill the
+            # simulation. This is done to simplify checkpointing at
+            # the end of a simulation!
+            self._unmount_virtio()
             self._gem5_util("exit")
             self.gem5simulation.wait()
         except EOF:
@@ -531,7 +595,7 @@ class Gem5Connection(TelnetConnection):
         try:
             shutil.rmtree(self.gem5_interact_dir)
         except OSError:
-            gem5_logger.warn("Failed to remove the temporary directory!")
+            gem5_logger.warning("Failed to remove the temporary directory!")
 
         # Delete the lock file
         os.remove(self.lock_file_name)
@@ -545,7 +609,22 @@ class Gem5Connection(TelnetConnection):
 
         self.connect_gem5(port, gem5_simulation, gem5_interact_dir, gem5_out_dir)
 
+    # Handle the EOF exception raised by pexpect
+    # pylint: disable=no-self-use
+    def _gem5_EOF_handler(self, gem5_simulation, gem5_out_dir, err):
+        # If we have reached the "EOF", it typically means
+        # that gem5 crashed and closed the connection. Let's
+        # check and actually tell the user what happened here,
+        # rather than spewing out pexpect errors.
+        if gem5_simulation.poll():
+            message = "The gem5 process has crashed with error code {}!\n\tPlease see {} for details."
+            raise TargetNotRespondingError(message.format(gem5_simulation.poll(), gem5_out_dir))
+        else:
+            # Let's re-throw the exception in this case.
+            raise err
+
     # This function connects to the gem5 simulation
+    # pylint: disable=too-many-statements
     def connect_gem5(self, port, gem5_simulation, gem5_interact_dir,
                       gem5_out_dir):
         """
@@ -567,7 +646,7 @@ class Gem5Connection(TelnetConnection):
         lock_file_name = '{}{}_{}.LOCK'.format(self.lock_directory, host, port)
         if os.path.isfile(lock_file_name):
             # There is already a connection to this gem5 simulation
-            raise TargetError('There is already a connection to the gem5 '
+            raise TargetStableError('There is already a connection to the gem5 '
                               'simulation using port {} on {}!'
                               .format(port, host))
 
@@ -582,9 +661,11 @@ class Gem5Connection(TelnetConnection):
                 break
             except pxssh.ExceptionPxssh:
                 pass
+            except EOF as err:
+                self._gem5_EOF_handler(gem5_simulation, gem5_out_dir, err)
         else:
             gem5_simulation.kill()
-            raise TargetError("Failed to connect to the gem5 telnet session.")
+            raise TargetNotRespondingError("Failed to connect to the gem5 telnet session.")
 
         gem5_logger.info("Connected! Waiting for prompt...")
 
@@ -602,13 +683,18 @@ class Gem5Connection(TelnetConnection):
                 self._login_to_device()
             except TIMEOUT:
                 pass
+            except EOF as err:
+                self._gem5_EOF_handler(gem5_simulation, gem5_out_dir, err)
+
             try:
                 # Try and force a prompt to be shown
                 self.conn.send('\n')
-                self.conn.expect([r'# ', self.conn.UNIQUE_PROMPT, r'\[PEXPECT\][\\\$\#]+ '], timeout=60)
+                self.conn.expect([r'# ', r'\$ ', self.conn.UNIQUE_PROMPT, r'\[PEXPECT\][\\\$\#]+ '], timeout=60)
                 prompt_found = True
             except TIMEOUT:
                 pass
+            except EOF as err:
+                self._gem5_EOF_handler(gem5_simulation, gem5_out_dir, err)
 
         gem5_logger.info("Successfully logged in")
         gem5_logger.info("Setting unique prompt...")
@@ -674,7 +760,7 @@ class Gem5Connection(TelnetConnection):
     def _gem5_util(self, command):
         """ Execute a gem5 utility command using the m5 binary on the device """
         if self.m5_path is None:
-            raise TargetError('Path to m5 binary on simulated system  is not set!')
+            raise TargetStableError('Path to m5 binary on simulated system  is not set!')
         self._gem5_shell('{} {}'.format(self.m5_path, command))
 
     def _gem5_shell(self, command, as_root=False, timeout=None, check_exit_code=True, sync=True):  # pylint: disable=R0912
@@ -688,12 +774,15 @@ class Gem5Connection(TelnetConnection):
         fails, warn, but continue with the potentially wrong output.
 
         The exit code is also checked by default, and non-zero exit codes will
-        raise a TargetError.
+        raise a TargetStableError.
         """
         if sync:
             self._sync_gem5_shell()
 
         gem5_logger.debug("gem5_shell command: {}".format(command))
+
+        if as_root:
+            command = 'echo {} | su'.format(quote(command))
 
         # Send the actual command
         self.conn.send("{}\n".format(command))
@@ -714,17 +803,17 @@ class Gem5Connection(TelnetConnection):
                 # prompt has returned. Hence, we have a bit of an issue. We
                 # warn, and return the whole output.
                 if command_index == -1:
-                    gem5_logger.warn("gem5_shell: Unable to match command in "
+                    gem5_logger.warning("gem5_shell: Unable to match command in "
                                      "command output. Expect parsing errors!")
                     command_index = 0
 
         output = output[command_index + len(command):].strip()
 
-        # It is possible that gem5 will echo the command. Therefore, we need to
-        # remove that too!
-        command_index = output.find(command)
-        if command_index != -1:
-            output = output[command_index + len(command):].strip()
+        # If the gem5 system echoes the executed command, we need to remove that too!
+        if self.strip_echoed_commands:
+            command_index = output.find(command)
+            if command_index != -1:
+                output = output[command_index + len(command):].strip()
 
         gem5_logger.debug("gem5_shell output: {}".format(output))
 
@@ -741,7 +830,7 @@ class Gem5Connection(TelnetConnection):
                 exit_code = int(exit_code_text.split()[0])
                 if exit_code:
                     message = 'Got exit code {}\nfrom: {}\nOUTPUT: {}'
-                    raise TargetError(message.format(exit_code, command, output))
+                    raise TargetStableError(message.format(exit_code, command, output))
             except (ValueError, IndexError):
                 gem5_logger.warning('Could not get exit code for "{}",\ngot: "{}"'.format(command, exit_code_text))
 
@@ -753,9 +842,33 @@ class Gem5Connection(TelnetConnection):
         """
         gem5_logger.info("Mounting VirtIO device in simulated system")
 
-        self._gem5_shell('su -c "mkdir -p {}" root'.format(self.gem5_input_dir))
+        self._gem5_shell('mkdir -p {}'.format(self.gem5_input_dir), as_root=True)
         mount_command = "mount -t 9p -o trans=virtio,version=9p2000.L,aname={} gem5 {}".format(self.gem5_interact_dir, self.gem5_input_dir)
-        self._gem5_shell(mount_command)
+        self._gem5_shell(mount_command, as_root=True)
+
+    def _unmount_virtio(self):
+        """
+        Unmount the VirtIO device in the simulated system.
+        """
+        gem5_logger.info("Unmounting VirtIO device in simulated system")
+
+        unmount_command = "umount {}".format(self.gem5_input_dir)
+        self._gem5_shell(unmount_command, as_root=True)
+
+    def take_checkpoint(self):
+        """
+        Take a checkpoint of the simulated system.
+
+        In order to take a checkpoint we first unmount the virtio
+        device, take then checkpoint, and then remount the device to
+        allow us to continue the current run. This needs to be done to
+        ensure that future gem5 simulations are able to utilise the
+        virtio device (i.e., we need to drop the current state
+        information that the device has).
+        """
+        self._unmount_virtio()
+        self._gem5_util("checkpoint")
+        self._mount_virtio()
 
     def _move_to_temp_dir(self, source):
         """
@@ -772,7 +885,7 @@ class Gem5Connection(TelnetConnection):
         Check if the gem5 platform is ready
         """
         if not self.ready:
-            raise TargetError('Gem5 is not ready to interact yet')
+            raise TargetTransientError('Gem5 is not ready to interact yet')
 
     def _wait_for_boot(self):
         pass
@@ -781,7 +894,8 @@ class Gem5Connection(TelnetConnection):
         """
         Internal method to check if the target has a certain file
         """
-        command = 'if [ -e \'{}\' ]; then echo 1; else echo 0; fi'
+        filepath = quote(filepath)
+        command = 'if [ -e {} ]; then echo 1; else echo 0; fi'
         output = self.execute(command.format(filepath), as_root=self.is_rooted)
         return boolean(output.strip())
 
@@ -837,8 +951,10 @@ class AndroidGem5Connection(Gem5Connection):
 def _give_password(password, command):
     if not sshpass:
         raise HostError('Must have sshpass installed on the host in order to use password-based auth.')
-    pass_string = "sshpass -p '{}' ".format(password)
-    return pass_string + command
+    pass_template = "sshpass -p {} "
+    pass_string = pass_template.format(quote(password))
+    redacted_string = pass_template.format(quote('<redacted>'))
+    return (pass_string + command, redacted_string + command)
 
 
 def _check_env():

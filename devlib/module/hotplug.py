@@ -1,3 +1,18 @@
+#    Copyright 2018 ARM Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 from devlib.module import Module
 
 
@@ -20,8 +35,13 @@ class HotplugModule(Module):
             cpu = 'cpu{}'.format(cpu)
         return target.path.join(cls.base_path, cpu, 'online')
 
+    def list_hotpluggable_cpus(self):
+        return [cpu for cpu in range(self.target.number_of_cpus)
+                if self.target.file_exists(self._cpu_path(self.target, cpu))]
+
     def online_all(self):
-        self.online(*range(self.target.number_of_cpus))
+        self.target._execute_util('hotplug_online_all',  # pylint: disable=protected-access
+                                  as_root=self.target.is_rooted)
 
     def online(self, *args):
         for cpu in args:
@@ -37,4 +57,3 @@ class HotplugModule(Module):
             return
         value = 1 if online else 0
         self.target.write_value(path, value)
-

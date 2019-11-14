@@ -1,4 +1,4 @@
-#    Copyright 2014-2015 ARM Limited
+#    Copyright 2014-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 #
 import logging
 from inspect import isclass
+
+from past.builtins import basestring
 
 from devlib.utils.misc import walk_modules
 from devlib.utils.types import identifier
@@ -35,6 +37,9 @@ class Module(object):
     #             serial).
     #  'connected' -- installed when a connection to to the target has been
     #                 established. This is the default.
+    #   'setup' -- installed after initial setup of the device has been performed.
+    #              This allows the module to utilize assets deployed during the
+    #              setup stage for example 'Busybox'.
     stage = 'connected'
 
     @staticmethod
@@ -56,10 +61,10 @@ class Module(object):
 
     def __init__(self, target):
         self.target = target
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logging.getLogger(self.name)
 
 
-class HardRestModule(Module):  # pylint: disable=R0921
+class HardRestModule(Module):
 
     kind = 'hard_reset'
 
@@ -67,7 +72,7 @@ class HardRestModule(Module):  # pylint: disable=R0921
         raise NotImplementedError()
 
 
-class BootModule(Module):  # pylint: disable=R0921
+class BootModule(Module):
 
     kind = 'boot'
 
@@ -75,7 +80,7 @@ class BootModule(Module):  # pylint: disable=R0921
         raise NotImplementedError()
 
     def update(self, **kwargs):
-        for name, value in kwargs.iteritems():
+        for name, value in kwargs.items():
             if not hasattr(self, name):
                 raise ValueError('Unknown parameter "{}" for {}'.format(name, self.name))
             self.logger.debug('Updating "{}" to "{}"'.format(name, value))
@@ -117,6 +122,6 @@ def register_module(mod):
 
 def __load_cache():
     for module in walk_modules('devlib.module'):
-        for obj in vars(module).itervalues():
+        for obj in vars(module).values():
             if isclass(obj) and issubclass(obj, Module) and obj.name:
                 register_module(obj)

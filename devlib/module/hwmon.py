@@ -1,4 +1,4 @@
-#    Copyright 2015 ARM Limited
+#    Copyright 2015-2018 ARM Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 import re
 from collections import defaultdict
 
+from devlib import TargetStableError
 from devlib.module import Module
 from devlib.utils.types import integer
 
@@ -73,20 +74,19 @@ class HwmonDevice(object):
     @property
     def sensors(self):
         all_sensors = []
-        for sensors_of_kind in self._sensors.itervalues():
-            all_sensors.extend(sensors_of_kind.values())
+        for sensors_of_kind in self._sensors.values():
+            all_sensors.extend(list(sensors_of_kind.values()))
         return all_sensors
 
-    def __init__(self, target, path):
+    def __init__(self, target, path, name, fields):
         self.target = target
         self.path = path
-        self.name = self.target.read_value(self.target.path.join(self.path, 'name'))
+        self.name = name
         self._sensors = defaultdict(dict)
         path = self.path
         if not path.endswith(self.target.path.sep):
             path += self.target.path.sep
-        for entry in self.target.list_directory(path,
-                                                as_root=self.target.is_rooted):
+        for entry in fields:
             match = HWMON_FILE_REGEX.search(entry)
             if match:
                 kind = match.group('kind')
@@ -99,7 +99,7 @@ class HwmonDevice(object):
 
     def get(self, kind, number=None):
         if number is None:
-            return [s for _, s in sorted(self._sensors[kind].iteritems(),
+            return [s for _, s in sorted(self._sensors[kind].items(),
                                          key=lambda x: x[0])]
         else:
             return self._sensors[kind].get(number)
@@ -116,7 +116,12 @@ class HwmonModule(Module):
 
     @staticmethod
     def probe(target):
-        return target.file_exists(HWMON_ROOT)
+        try:
+            target.list_directory(HWMON_ROOT, as_root=target.is_rooted)
+        except TargetStableError:
+            # Doesn't exist or no permissions
+            return False
+        return True
 
     @property
     def sensors(self):
@@ -132,11 +137,12 @@ class HwmonModule(Module):
         self.scan()
 
     def scan(self):
-        for entry in self.target.list_directory(self.root,
-                                                as_root=self.target.is_rooted):
-            if entry.startswith('hwmon'):
-                entry_path = self.target.path.join(self.root, entry)
-                if self.target.file_exists(self.target.path.join(entry_path, 'name')):
-                    device = HwmonDevice(self.target, entry_path)
-                    self.devices.append(device)
-
+        values_tree = self.target.read_tree_values(self.root, depth=3, tar=True)
+        for entry_id, fields in values_tree.items():
+            path = self.target.path.join(self.root, entry_id)
+            name = fields.pop('name', None)
+            if name is None:
+                continue
+            self.logger.debug('Adding device {}'.format(name))
+            device = HwmonDevice(self.target, path, name, fields)
+            self.devices.append(device)
